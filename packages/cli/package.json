@@ -1,0 +1,263 @@
+{
+  "name": "@archon/cli",
+  "version": "0.14.0",
+  "type": "module",
+  "main": "./src/cli.ts",
+  "bin": {
+    "archon": "./src/cli.ts"
+  },
+  "scripts": {
+    "cli": "bun src/cli.ts",
+    "test": "bun run ../../scripts/package-tests.ts",
+    "type-check": "bun x tsc --noEmit"
+  },
+  "dependencies": {
+    "@archon/adapters": "workspace:*",
+    "@archon/core": "workspace:*",
+    "@archon/git": "workspace:*",
+    "@archon/isolation": "workspace:*",
+    "@archon/paths": "workspace:*",
+    "@archon/provider-contract": "workspace:*",
+    "@archon/providers": "workspace:*",
+    "@archon/workflows": "workspace:*",
+    "@clack/prompts": "^1.0.0",
+    "@archon/forge": "workspace:*",
+    "@hono/zod-openapi": "^1.4.0",
+    "dotenv": "^17.2.3",
+    "@archon/plugin-manifest": "workspace:*",
+    "@archon/chat-contract": "workspace:*",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  },
+  "testConcurrency": 3,
+  "testGroups": [
+    [
+      "src/commands/doctor-workflow-providers.test.ts"
+    ],
+    [
+      "src/commands/provider-upgrade.test.ts"
+    ],
+    [
+      "src/commands/workflow-protocol-receipt.test.ts"
+    ],
+    [
+      "src/routes/workflow-run.test.ts"
+    ],
+    [
+      "src/routes/workflow.test.ts"
+    ],
+    [
+      "src/commands/image-chat-plugin.test.ts"
+    ],
+    [
+      "src/commands/plugin-chat.test.ts"
+    ],
+    [
+      "src/commands/inspect-chat-plugin.test.ts"
+    ],
+    [
+      "src/commands/inspect-chat-plugin.integration.test.ts"
+    ],
+    [
+      "src/commands/publish-plugin.test.ts"
+    ],
+    [
+      "src/commands/version.test.ts",
+      "src/commands/setup.test.ts",
+      "src/commands/setup-ai.test.ts",
+      "src/commands/setup-github.test.ts",
+      "src/commands/setup-github-overlays.test.ts",
+      "src/commands/setup-github-authentication.test.ts",
+      "src/commands/setup-env.test.ts",
+      "src/commands/setup-provider-auth.test.ts",
+      "src/commands/setup-pi-credential.test.ts",
+      "src/commands/skill.test.ts",
+      "src/commands/doctor.test.ts",
+      "src/commands/doctor-assistant-login.test.ts",
+      "src/commands/doctor-config.test.ts",
+      "src/commands/doctor-connected-providers.test.ts",
+      "src/commands/doctor-database.test.ts",
+      "src/commands/doctor-folder-project.test.ts",
+      "src/commands/doctor-install.test.ts",
+      "src/commands/doctor-platforms.test.ts",
+      "src/commands/doctor-providers.test.ts",
+      "src/commands/doctor-skill.test.ts",
+      "src/commands/doctor-process-provider.test.ts",
+      "src/commands/telemetry.test.ts"
+    ],
+    [
+      "src/commands/workflow.test.ts"
+    ],
+    [
+      "src/commands/workflow-run-owned.test.ts",
+      "src/commands/workflow-run-inputs.test.ts",
+      "src/commands/workflow-run-resume.test.ts",
+      "src/commands/workflow-run-config.test.ts",
+      "src/commands/workflow-run-capture.test.ts",
+      "src/commands/workflow-run-signals.test.ts",
+      "src/commands/workflow-run-adoption.test.ts",
+      "src/commands/workflow-run-credentials.test.ts"
+    ],
+    [
+      "src/commands/workflow-control.test.ts"
+    ],
+    [
+      "src/commands/workflow-shared.test.ts"
+    ],
+    [
+      "src/commands/workflow-list.test.ts"
+    ],
+    [
+      "src/commands/workflow-types.test.ts"
+    ],
+    [
+      "src/commands/workflow-run-output.test.ts"
+    ],
+    [
+      "src/commands/workflow-transcript.test.ts"
+    ],
+    [
+      "src/commands/workflow-inspect.test.ts"
+    ],
+    [
+      "src/commands/workflow-end-turn.test.ts"
+    ],
+    [
+      "src/commands/workflow-runs.test.ts"
+    ],
+    [
+      "src/commands/workflow-wait.test.ts"
+    ],
+    [
+      "src/commands/workflow-item-runs.test.ts"
+    ],
+    [
+      "src/commands/workflow-detach.test.ts"
+    ],
+    [
+      "src/commands/workflow-isolation.test.ts"
+    ],
+    [
+      "src/commands/workflow-run-preflight.test.ts"
+    ],
+    [
+      "src/commands/workflow-dry-run.test.ts"
+    ],
+    [
+      "src/commands/workflow-wait-continuation.test.ts"
+    ],
+    [
+      "src/commands/doctor-dispatch.test.ts",
+      "src/commands/doctor-forge-parity.test.ts"
+    ],
+    [
+      "src/commands/setup-exit.test.ts"
+    ],
+    [
+      "src/commands/setup-spawn.test.ts"
+    ],
+    [
+      "src/commands/isolation.test.ts"
+    ],
+    [
+      "src/commands/isolation-completion-registration.test.ts"
+    ],
+    [
+      "src/commands/chat.test.ts"
+    ],
+    [
+      "src/commands/serve.test.ts"
+    ],
+    [
+      "src/commands/serve-web-archive.test.ts"
+    ],
+    [
+      "src/commands/serve-binary.test.ts"
+    ],
+    [
+      "src/commands/ai.test.ts"
+    ],
+    [
+      "src/commands/provider.test.ts"
+    ],
+    [
+      "src/commands/setup-provider.test.ts"
+    ],
+    [
+      "src/commands/validate.test.ts"
+    ],
+    [
+      "src/commands/metrics.test.ts"
+    ],
+    [
+      "src/cli.test.ts",
+      "src/workflow-scope-boot.test.ts",
+      "src/help.test.ts",
+      "src/default-cwd-canonicalization.test.ts",
+      "src/utils/stdout.test.ts",
+      "src/utils/workflow-exit-code.test.ts",
+      "src/utils/safe-console.test.ts",
+      "src/utils/cli-start-telemetry.test.ts",
+      "src/utils/cli-program-arguments.test.ts",
+      "src/utils/run-job-escape.test.ts"
+    ],
+    [
+      "src/utils/detached-resume-receipt.test.ts"
+    ],
+    [
+      "src/utils/owned-run-termination.test.ts"
+    ],
+    [
+      "src/utils/owned-run-lease.test.ts"
+    ],
+    [
+      "src/commands/workflow-attention-text.test.ts",
+      "src/commands/workflow-item-text.test.ts"
+    ],
+    [
+      "src/adapters/cli-adapter.test.ts"
+    ],
+    [
+      "src/commands/forge.test.ts",
+      "src/commands/script-types.test.ts"
+    ],
+    [
+      "src/commands/plugin.test.ts",
+      "src/commands/plugin-pack.test.ts"
+    ],
+    [
+      "src/commands/pack.test.ts"
+    ],
+    [
+      "src/triggers/native-schedule.test.ts"
+    ],
+    [
+      "src/triggers/add-trigger-file.test.ts"
+    ],
+    [
+      "src/commands/workflow-continuations.test.ts"
+    ],
+    [
+      "src/commands/workflow-continuation-source.test.ts"
+    ],
+    [
+      "src/commands/user.test.ts"
+    ],
+    [
+      "src/commands/project.test.ts",
+      "src/commands/workflow-artifacts.test.ts"
+    ],
+    [
+      "src/commands/auth.test.ts"
+    ],
+    [
+      "src/test-support/workflow-store.conformance.test.ts"
+    ],
+    [
+      "src/commands/state.test.ts",
+      "src/test-support/state-document-store.conformance.test.ts"
+    ]
+  ]
+}

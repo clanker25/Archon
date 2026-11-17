@@ -1,0 +1,332 @@
+/** Side-effect-free workflow DAG simulation with caller-supplied node outputs. */
+import { formatSkipCause } from './skip-cause';
+import { createLogger, getArchonTempPath } from '@archon/paths';
+import { validateStructuredOutput } from './structured-output';
+import { randomUUID } from 'node:crypto';
+import { rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { readComposedBindings } from './compiled-command';
+import { declaredOutcome, outcomeFromValue } from './completed-outcome';
+import { parseWholeExecutionCheckoutRef } from './output-ref';
+import { resolveWorkflowModelScope, assistantModelDefaults } from './node-model-resolution';
+import type { ResolvedAiProfile } from './model-validation';
+import type { WorkflowConfig } from './deps';
+import { liveSourceRoots, type WorkflowSourceRoots } from './workflow-source';
+import { resolveRunStartInputs, type RunStartInputs } from './pack-settings';
+import {
+  isExecNode,
+  isAgentNode,
+  isLoopGroupNode,
+  type DagNode,
+  type NodeOutput,
+  type ResolvedWorkflow,
+  type RunCompletedOutcome,
+} from './schemas';
+import type { DryRunContext } from './dry-run/context';
+import {
+  dryRunResultSchema,
+  type DryRunResult,
+  type DryRunResolution,
+  type DryRunTraceEntry,
+} from './dry-run/schemas';
+import { isRecord, type DryRunStubs } from './dry-run/stubs';
+import { simulateNodes } from './dry-run/simulate';
+
+export {
+  dryRunResultSchema,
+  dryRunTraceEntrySchema,
+  type DryRunResolution,
+  type DryRunResult,
+  type DryRunTraceEntry,
+} from './dry-run/schemas';
+export {
+  RESERVED_FIXTURE_KEYS,
+  createDryRunStubScaffold,
+  dryRunStubValueSchema,
+  dryRunStubsSchema,
+  loadDryRunStubs,
+  writeDryRunStubScaffold,
+  type DryRunStubValue,
+  type DryRunStubs,
+} from './dry-run/stubs';
+
+/** Lazy-initialized logger (deferred so test mocks can intercept createLogger) */
+let cachedLog: ReturnType<typeof createLogger> | undefined;
+function getLog(): ReturnType<typeof createLogger> {
+  cachedLog ??= createLogger('workflow.dry-run');
+  return cachedLog;
+}
+
+function checkoutConsumerBindings(node: DagNode) {
+  if (isExecNode(node)) return node.with;
+  if (!isAgentNode(node)) return undefined;
+  return node.source.kind === 'command' ? node.source.with : readComposedBindings(node);
+}
+
+/** Producers some node binds with `$<node>.execution.checkoutStart`, at any depth. */
+function collectCheckoutProducers(
+  nodes: readonly DagNode[],
+  into = new Set<string>()
+): Set<string> {
+  for (const node of nodes) {
+    if (isLoopGroupNode(node)) collectCheckoutProducers(node.loop_group.nodes as DagNode[], into);
+    const nodeWith = checkoutConsumerBindings(node);
+    for (const value of Object.values(nodeWith ?? {})) {
+      const producer =
+        typeof value === 'string' ? parseWholeExecutionCheckoutRef(value) : undefined;
+      if (producer !== undefined) into.add(producer);
+    }
+  }
+  return into;
+}
+
+/**
+ * The outcome the simulated run completes with, read as the completion write reads it.
+ * Null unless the simulation completed and the returns node's value is a stubbed or
+ * executed one that satisfies its schema: a placeholder output is not an outcome.
+ */
+function resolveDryRunOutcome(
+  workflow: ResolvedWorkflow,
+  outputs: ReadonlyMap<string, NodeOutput>,
+  consumedStubs: ReadonlySet<string>,
+  execCode: boolean
+): RunCompletedOutcome | null {
+  const declared = declaredOutcome(workflow);
+  const returns = workflow.returns;
+  if (declared === undefined || returns === undefined) return null;
+
+  const selectedNode = workflow.nodes.find(node => node.id === returns);
+  if (
+    !consumedStubs.has(returns) &&
+    !(execCode && selectedNode !== undefined && isExecNode(selectedNode))
+  )
+    return null;
+
+  const selectedOutput = outputs.get(returns);
+  if (selectedOutput?.state !== 'completed' || !('structuredOutput' in selectedOutput)) return null;
+
+  const structured = selectedOutput.structuredOutput;
+  if (
+    selectedNode?.output_format === undefined ||
+    !validateStructuredOutput(structured, selectedNode.output_format).valid
+  ) {
+    return null;
+  }
+  if (!isRecord(structured) || !Object.hasOwn(structured, declared.field)) return null;
+
+  const outcome = outcomeFromValue(declared.form, structured[declared.field]);
+  return 'invalid' in outcome ? null : outcome;
+}
+
+interface DryRunOptions {
+  workflow: ResolvedWorkflow;
+  userMessage: string;
+  cwd: string;
+  stubs?: DryRunStubs;
+  /**
+   * Caller-SUPPLIED input values, already validated against the workflow's declared
+   * `inputs:` and pack settings at the invocation gate (`resolveTopLevelInputs`) — the
+   * same contract a real run enforces before any cost. Pack settings and declared
+   * defaults are layered under them here, by the function a real run starts with
+   * (`resolveRunStartInputs`), so the effective `$INPUTS` map cannot diverge between
+   * simulation and execution (#2610).
+   */
+  inputs?: Record<string, string>;
+  /**
+   * Where exec-code nodes execute. Undefined means `cwd` — the direct
+   * `--dry-run --exec-code` path. `workflow test` supplies an isolated scratch
+   * worktree so a fixture verdict cannot depend on the caller's tree state (#2851).
+   */
+  execWorkspace?: string;
+  /**
+   * Where named scripts and command files are READ from. Undefined means live off
+   * `cwd`, which is the direct `--dry-run` path; `workflow test` passes the roots of
+   * the source capture it froze for the invocation (#2851).
+   */
+  sourceRoots?: WorkflowSourceRoots;
+  execCode?: boolean;
+  /** Fill reached nodes without explicit stubs using schema-valid deterministic placeholders. */
+  defaultStubs?: boolean;
+  pauseAtGates?: boolean;
+  /**
+   * The install's resolved config and AI profile. Supplying them is what makes the
+   * per-node provider/model report match what a real run would do; without them the
+   * report falls back to the bare default assistant with no tier or alias resolution.
+   * Config also supplies project environment values and protected credential provenance.
+   */
+  config?: WorkflowConfig;
+  aiProfile?: ResolvedAiProfile;
+}
+
+function createDryRunContext(
+  options: DryRunOptions,
+  tempRoot: string,
+  { inputs }: RunStartInputs
+): DryRunContext {
+  const assistantModels = options.config ? assistantModelDefaults(options.config) : {};
+  return {
+    envVars: options.config?.envVars,
+    protectedEnvKeys: options.config?.protectedEnvKeys,
+    protectedCredentialValues: options.config?.protectedCredentialValues,
+    workflow: options.workflow,
+    userMessage: options.userMessage,
+    cwd: options.cwd,
+    execWorkspace: options.execWorkspace ?? options.cwd,
+    sourceRoots: options.sourceRoots ?? liveSourceRoots(options.cwd),
+    stubs: options.stubs ?? {},
+    checkoutProducers: collectCheckoutProducers(options.workflow.nodes),
+    ...(inputs ? { inputs } : {}),
+    loopBodyScopes: [],
+    loopGroupPath: [],
+    typedOutputs: [],
+    artifactsDir: join(tempRoot, 'artifacts'),
+    stateDir: join(tempRoot, 'state'),
+    logDir: join(tempRoot, 'logs'),
+    execCode: options.execCode ?? false,
+    defaultStubs: options.defaultStubs ?? false,
+    pauseAtGates: options.pauseAtGates ?? false,
+    trace: [],
+    consumedStubs: new Set<string>(),
+    missingStubs: new Set<string>(),
+    toleratedMissingStubs: new Set<string>(),
+    scope: resolveWorkflowModelScope(
+      options.workflow,
+      options.config?.assistant,
+      assistantModels,
+      options.aiProfile
+    ),
+    assistantModels,
+    ...(options.aiProfile ? { aiProfile: options.aiProfile } : {}),
+  };
+}
+
+export async function dryRunWorkflow(options: DryRunOptions): Promise<DryRunResult> {
+  const tempRoot = join(getArchonTempPath(), `dry-run-${randomUUID()}`);
+  // The same layering a real run fixes at its start: pack defaults, then declared
+  // defaults, then the project's `.archon/packs/` file, then supplied values.
+  const ctx = createDryRunContext(
+    options,
+    tempRoot,
+    await resolveRunStartInputs(options.cwd, options.workflow, options.inputs)
+  );
+  const outputs = new Map<string, NodeOutput>();
+  try {
+    await simulateNodes(options.workflow.plan, outputs, ctx);
+  } finally {
+    // Simulations are throwaway: whatever exec'd nodes wrote is discarded with the
+    // per-run root (`force: true` makes the nothing-executed case a no-op). A cleanup
+    // failure must not fail a finished simulation, so it is logged, not thrown.
+    await rm(tempRoot, { recursive: true, force: true }).catch((error: unknown) => {
+      getLog().warn(
+        { tempRoot, error: error instanceof Error ? error.message : String(error) },
+        'dry_run.temp_cleanup_failed'
+      );
+    });
+  }
+
+  const summary = options.workflow.plan.sinks
+    .map(nodeId => outputs.get(nodeId))
+    .find(output => output?.state === 'completed' && output.output.trim())?.output;
+  const anyFailed = [...outputs.values()].some(output => output.state === 'failed');
+  const outcome =
+    ctx.halted === 'paused'
+      ? 'paused'
+      : ctx.halted === 'cancelled'
+        ? 'cancelled'
+        : anyFailed
+          ? 'failed'
+          : 'completed';
+  const completedOutcome =
+    outcome === 'completed'
+      ? resolveDryRunOutcome(options.workflow, outputs, ctx.consumedStubs, ctx.execCode)
+      : null;
+  return dryRunResultSchema.parse({
+    workflow: options.workflow.name,
+    outcome,
+    declaresOutcome: declaredOutcome(options.workflow) !== undefined,
+    authoredOutcome: completedOutcome?.kind === 'boolean' ? completedOutcome.value : null,
+    completedOutcome: completedOutcome?.value ?? null,
+    trace: ctx.trace,
+    missingStubs: [...ctx.missingStubs].sort(),
+    toleratedMissingStubs: [...ctx.toleratedMissingStubs].sort(),
+    unusedStubs: Object.keys(ctx.stubs)
+      .filter(id => !ctx.consumedStubs.has(id))
+      .sort(),
+    ...(summary ? { summary } : {}),
+  });
+}
+
+export function formatDryRunTrace(result: DryRunResult): string {
+  const lines = [
+    `Dry-run: ${result.workflow}`,
+    '',
+    ...result.trace.flatMap(formatDryRunTraceEntry),
+  ];
+  lines.push(
+    '',
+    `Simulation outcome: ${result.outcome}`,
+    `Authored outcome: ${result.declaresOutcome ? (result.completedOutcome ?? 'none') : 'undeclared'}`
+  );
+  if (result.missingStubs.length > 0)
+    lines.push(`Missing stubs: ${result.missingStubs.join(', ')}`);
+  if (result.unusedStubs.length > 0) lines.push(`Unused stubs: ${result.unusedStubs.join(', ')}`);
+  if (result.summary) lines.push(`Summary: ${result.summary}`);
+  return lines.join('\n');
+}
+
+/** The part of a trace entry its first line renders: identity, status and reason. */
+export type DryRunTraceSummary = Pick<DryRunTraceEntry, 'nodeId' | 'nodeType' | 'state'> & {
+  readonly iteration?: number;
+  readonly reason?: string;
+};
+
+/**
+ * What a failed fixture publishes per node: identity, status and the engine's own reason,
+ * never resolved text, outputs or skip conditions, which can carry input values. A failed
+ * node's reason is its diagnostic, which the fixture reports in `nodeFailures`.
+ */
+export function summarizeTraceEntry(entry: DryRunTraceEntry): DryRunTraceSummary {
+  return {
+    nodeId: entry.nodeId,
+    nodeType: entry.nodeType,
+    state: entry.state,
+    ...(entry.iteration ? { iteration: entry.iteration } : {}),
+    ...(entry.state !== 'failed' && entry.reason ? { reason: entry.reason } : {}),
+  };
+}
+
+/** One trace entry's status line; `workflow test` prints these under a failed fixture. */
+export function formatDryRunTraceLine(entry: DryRunTraceSummary): string {
+  const suffix = entry.reason ? ` — ${entry.reason}` : '';
+  const iteration = entry.iteration ? ` [iteration ${String(entry.iteration)}]` : '';
+  return `${entry.state.toUpperCase().padEnd(9)} ${entry.nodeId} (${entry.nodeType})${iteration}${suffix}`;
+}
+
+function formatDryRunTraceEntry(entry: DryRunTraceEntry): string[] {
+  const reason =
+    entry.state === 'skipped' ? `${entry.reason} (${formatSkipCause(entry.cause)})` : entry.reason;
+  const lines = [formatDryRunTraceLine({ ...entry, reason })];
+  if (entry.state === 'skipped' && entry.diagnostic)
+    lines.push(`  diagnostic: ${entry.diagnostic}`);
+  if (entry.resolution) lines.push(...formatDryRunResolution(entry.resolution));
+  if (entry.resolvedText) lines.push(`  resolved: ${entry.resolvedText}`);
+  if (entry.output !== undefined) lines.push(`  output: ${entry.output}`);
+  return lines;
+}
+
+function formatDryRunResolution(resolution: DryRunResolution): string[] {
+  const lines: string[] = [];
+  const authored = resolution.authoredIn ? ` [from ${resolution.authoredIn}]` : '';
+  const model = resolution.model ?? '(provider default)';
+  lines.push(
+    `  runs on: ${resolution.provider} (${resolution.providerFrom}) / ${model} (${resolution.modelFrom})${authored}`
+  );
+  if (resolution.effort) lines.push(`  effort: ${resolution.effort} (${resolution.effortFrom})`);
+  if (resolution.providerConflict) {
+    const c = resolution.providerConflict;
+    lines.push(
+      `  warning: declares provider '${c.declared}' but model '${c.modelRef}' resolves to '${c.resolved}' — using '${c.resolved}'`
+    );
+  }
+  return lines;
+}

