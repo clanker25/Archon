@@ -1,0 +1,34 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@archon/adapters": ["../adapters/src"],
+      "@archon/adapters/*": ["../adapters/src/*"],
+      "@archon/core": ["../core/src"],
+      "@archon/core/*": ["../core/src/*"],
+      // The CLI does not depend on the server. scripts/check-cli-import-boundary.ts injects a
+      // server import into the CLI bundle as its negative proof, and Bun resolves it here.
+      "@archon/server": ["../server/src"],
+      "@archon/server/*": ["../server/src/*"],
+      "@archon/workflows": ["../workflows/src"],
+      "@archon/workflows/*": ["../workflows/src/*"],
+      "@archon/paths": ["../paths/src"],
+      "@archon/git": ["../git/src"]
+    }
+  },
+  "include": ["src/**/*", "../workflows/src/defaults/text-imports.d.ts"],
+  "exclude": ["node_modules", "dist"],
+  "references": [
+    { "path": "../adapters" },
+    { "path": "../chat-contract" },
+    { "path": "../core" },
+    { "path": "../forge" },
+    { "path": "../git" },
+    { "path": "../isolation" },
+    { "path": "../paths" },
+    { "path": "../plugin-manifest" },
+    { "path": "../provider-contract" },
+    { "path": "../providers" },
+    { "path": "../workflows" }
+  ]
+}

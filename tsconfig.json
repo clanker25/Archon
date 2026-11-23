@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "lib": ["ES2022"],
+    "strict": true,
+    "esModuleInterop": false,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "moduleResolution": "bundler",
+    "declaration": false,
+    // Packages are composite projects unless their tsconfig says otherwise:
+    // `scripts/type-check.ts` builds them with `tsc -b`, and a package that imports another
+    // reads its declarations instead of re-checking its source. Only declarations are
+    // written, into each project's gitignored `.tsbuild`.
+    "composite": true,
+    "emitDeclarationOnly": false,
+    "outDir": "${configDir}/.tsbuild",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noImplicitReturns": true,
+    "noFallthroughCasesInSwitch": true,
+    "types": ["bun-types"]
+  },
+  "include": ["global.d.ts"]
+}

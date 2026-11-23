@@ -1,0 +1,14 @@
+{
+  "name": "@archon/chat-slack",
+  "version": "0.14.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "bun run ../../scripts/package-tests.ts",
+    "test:conformance": "bun src/test/conformance-cli.ts"
+  },
+  "dependencies": {
+    "@archon/chat-contract": "workspace:*",
+    "@slack/bolt": "^4.6.0"
+  }
+}

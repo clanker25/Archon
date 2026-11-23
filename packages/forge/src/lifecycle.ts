@@ -1,0 +1,795 @@
+/**
+ * Work-item and pull-request lifecycle operations, and the evidence a mutation
+ * owes its caller.
+ *
+ * A write that cannot prove it landed is not a failure a caller may retry blindly.
+ * Every mutation therefore resolves to exactly one of four outcomes: `applied`
+ * (performed and read back), `refused` (nothing was written), `verification_failed`
+ * (the write was acknowledged but the read-back disagreed), or `outcome_unknown`
+ * (the request may or may not have reached the forge). The last two carry what a
+ * reconciling operator needs, never a promise that the mutation was prevented.
+ */
+
+import { z } from 'zod';
+import {
+  forgeSubjectRefSchema,
+  gitObjectIdSchema,
+  prRefSchema,
+  repoRefSchema,
+  workItemRefSchema,
+  sourceActorSchema,
+} from './identity';
+
+import { checkSelectionSchema, selectedChecksSchema } from './checks';
+
+const text = z.string().min(1);
+
+/** Branch names and object IDs stay separate facts for every consumer. */
+export const forgePrRecordSchema = prRefSchema.extend({
+  schemaVersion: z.literal(1),
+  url: z.url(),
+  head: text,
+  base: text,
+  is_draft: z.boolean(),
+  state: z.enum(['open', 'closed', 'merged']),
+  head_repo: repoRefSchema.nullable(),
+  head_revision: gitObjectIdSchema.nullable(),
+  base_revision: gitObjectIdSchema.nullable(),
+  maintainer_can_modify: z.boolean().nullable(),
+});
+export type ForgePrRecord = z.infer<typeof forgePrRecordSchema>;
+
+const requestBase = z.object({ operationId: text });
+
+export const workItemViewRequestSchema = requestBase.extend({
+  op: z.literal('workitem.view'),
+  ref: workItemRefSchema,
+});
+/**
+ * A pull request by number, or the pull request for a qualified head.
+ * The head form answers "does this branch already have a pull request", so by
+ * default it resolves only the open one, never one closed earlier. `state: "any"`
+ * asks instead for the newest pull request on that head in any state, which a
+ * plugin must declare it supports with `PR_VIEW_ANY_STATE`.
+ */
+export const prViewRequestSchema = requestBase.extend({
+  op: z.literal('pr.view'),
+  selector: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('number'), ref: prRefSchema }),
+    z.object({
+      kind: z.literal('head'),
+      repo: repoRefSchema,
+      headRepo: repoRefSchema,
+      head: text,
+      base: text.optional(),
+      state: z.enum(['open', 'any']).optional(),
+    }),
+  ]),
+});
+/**
+ * The capability a plugin advertises when it answers a `pr.view` head selector
+ * with `state: "any"`. An older plugin would ignore the field and answer for the
+ * open pull request only, so the host refuses the request without it.
+ */
+export const PR_VIEW_ANY_STATE = 'pr.view:any-state';
+export const prCreateRequestSchema = requestBase.extend({
+  op: z.literal('pr.create'),
+  repo: repoRefSchema,
+  headRepo: repoRefSchema,
+  head: text,
+  headRevision: gitObjectIdSchema,
+  base: text,
+  title: text,
+  body: z.string(),
+  draft: z.boolean(),
+});
+export const prEditBodyRequestSchema = requestBase.extend({
+  op: z.literal('pr.edit-body'),
+  ref: prRefSchema,
+  body: z.string(),
+});
+export const prReadyRequestSchema = requestBase.extend({
+  op: z.literal('pr.ready'),
+  ref: prRefSchema,
+});
+export const prDraftRequestSchema = requestBase.extend({
+  op: z.literal('pr.draft'),
+  ref: prRefSchema,
+});
+// Closing never merges, deletes the head branch or writes a comment; a caller
+// that wants to say why uses a comment operation.
+export const prCloseRequestSchema = requestBase.extend({
+  op: z.literal('pr.close'),
+  ref: prRefSchema,
+});
+// The marker identifies the one canonical comment, so it has to survive a
+// first-line comparison against a body the forge may have re-wrapped.
+const commentMarker = text.refine(
+  value => !/[\r\n]/.test(value),
+  'comment marker must be one line'
+);
+/** The pull-request form, kept for callers and installed plugins that predate subjects. */
+export const commentUpsertRequestSchema = requestBase.extend({
+  op: z.literal('comment.upsert'),
+  ref: prRefSchema,
+  marker: commentMarker,
+  body: text,
+});
+/** The canonical marked comment on an issue or a pull request. */
+export const workItemCommentUpsertRequestSchema = requestBase.extend({
+  op: z.literal('workitem.comment.upsert'),
+  subject: forgeSubjectRefSchema,
+  marker: commentMarker,
+  body: text,
+});
+
+export const labelNamesSchema = z
+  .array(text)
+  .refine(names => new Set(names).size === names.length, 'label names must be unique');
+export const repoLabelsListRequestSchema = requestBase.extend({
+  op: z.literal('repo.labels.list'),
+  repo: repoRefSchema,
+});
+export const repoLabelsListSchema = z.object({
+  repo: repoRefSchema,
+  labels: z.array(z.object({ name: text })),
+});
+export const workItemCreateRequestSchema = requestBase
+  .extend({
+    op: z.literal('workitem.create'),
+    repo: repoRefSchema,
+    title: text,
+    body: text,
+    marker: text.refine(value => !/[\r\n]/.test(value), 'marker must be one line'),
+  })
+  .refine(
+    value => value.body.split(/\r?\n/, 1)[0] === value.marker,
+    'body must begin with the exact marker'
+  );
+export const workItemLabelsSetRequestSchema = requestBase.extend({
+  op: z.literal('workitem.labels.set'),
+  ref: workItemRefSchema,
+  labels: labelNamesSchema,
+});
+/**
+ * One label added to or removed from an issue or pull request, leaving every
+ * other label untouched, so concurrent writers on one item cannot drop each
+ * other's labels the way two whole-set replacements can.
+ */
+export const workItemLabelAddRequestSchema = requestBase.extend({
+  op: z.literal('workitem.label.add'),
+  subject: forgeSubjectRefSchema,
+  name: text,
+});
+export const workItemLabelRemoveRequestSchema = requestBase.extend({
+  op: z.literal('workitem.label.remove'),
+  subject: forgeSubjectRefSchema,
+  name: text,
+});
+export const closeReasonSchema = z.enum(['completed', 'not_planned', 'duplicate']);
+/** Close an issue, recording why. An issue already closed for another reason is refused. */
+export const workItemCloseRequestSchema = requestBase.extend({
+  op: z.literal('workitem.close'),
+  ref: workItemRefSchema,
+  reason: closeReasonSchema,
+});
+/** Open issues and pull requests that carry one label. */
+export const workItemListRequestSchema = requestBase.extend({
+  op: z.literal('workitem.list'),
+  repo: repoRefSchema,
+  label: text,
+});
+/**
+ * When `name` was last added to an issue or pull request, by the forge's own label event.
+ * The event's id tells two adds of the same label apart, so a remove and re-add is a new
+ * add even when the label is on the item both times it is read.
+ */
+export const workItemLabelAddedRequestSchema = requestBase.extend({
+  op: z.literal('workitem.label.added'),
+  subject: forgeSubjectRefSchema,
+  name: text,
+});
+/** The most matches one `workitem.search` returns, and the count it returns when none is asked for. */
+export const WORKITEM_SEARCH_MAX_LIMIT = 200;
+export const WORKITEM_SEARCH_DEFAULT_LIMIT = 20;
+/**
+ * Issues and pull requests in one repository that match free text.
+ *
+ * How `text` matches is the forge's own search, not a query language this contract
+ * defines. `state` defaults to `open`; `kind` omitted searches both. The answer is
+ * bounded by `limit`, most recently updated first, and says when more matched.
+ */
+export const workItemSearchRequestSchema = requestBase.extend({
+  op: z.literal('workitem.search'),
+  repo: repoRefSchema,
+  text: z.string().trim().min(1),
+  kind: z.enum(['issue', 'pr']).optional(),
+  state: z.enum(['open', 'closed', 'any']).optional(),
+  limit: z.number().int().positive().max(WORKITEM_SEARCH_MAX_LIMIT).optional(),
+});
+export const repoLabelEnsureRequestSchema = requestBase.extend({
+  op: z.literal('repo.label.ensure'),
+  repo: repoRefSchema,
+  name: text,
+  color: z
+    .string()
+    .regex(/^[0-9a-fA-F]{6}$/)
+    .transform(value => value.toLowerCase()),
+  description: z.string(),
+});
+export const workItemRecordSchema = z.object({
+  ref: workItemRefSchema,
+  kind: z.literal('issue'),
+  url: z.url(),
+  state: z.enum(['open', 'closed']),
+});
+export type ForgeWorkItemRecord = z.infer<typeof workItemRecordSchema>;
+/** An issue or a pull request, as a label operation or listing observed it. */
+export const subjectRecordSchema = workItemRecordSchema.extend({ kind: z.enum(['issue', 'pr']) });
+export type ForgeSubjectRecord = z.infer<typeof subjectRecordSchema>;
+export const labelRecordSchema = z.object({ name: text, color: text, descriptionDigest: text });
+export type ForgeLabelRecord = z.infer<typeof labelRecordSchema>;
+export const mergeConditionsSchema = z.strictObject({
+  head: gitObjectIdSchema.optional(),
+  base: gitObjectIdSchema.optional(),
+  tree: gitObjectIdSchema.optional(),
+});
+export const mergeConditionSchema = mergeConditionsSchema.keyof();
+export const prMergeRequestSchema = requestBase.extend({
+  op: z.literal('pr.merge'),
+  ref: prRefSchema,
+  method: z.enum(['merge', 'squash']),
+  conditions: mergeConditionsSchema,
+});
+export const checksRerunRequestSchema = requestBase.extend({
+  op: z.literal('checks.rerun'),
+  ref: prRefSchema,
+  revision: gitObjectIdSchema,
+  units: selectedChecksSchema,
+});
+export const prReviewsRequestSchema = requestBase.extend({
+  op: z.literal('pr.reviews'),
+  ref: prRefSchema,
+});
+/**
+ * The caller's identity for a review posted through `pr.review.submit`, such as its run
+ * id. One line with no `>`, so a plugin can carry it inside an HTML comment.
+ */
+export const reviewKeySchema = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
+/**
+ * `submitKey` is the key a review was posted with through `pr.review.submit`; on a
+ * `review_comment` it is that of the review the comment belongs to. Absent means the
+ * item was not posted through that operation, or a plugin older than the field answered.
+ * It tells Archon's own reviews from others; it is not an authenticated identity.
+ */
+export const reviewItemSchema = z.object({
+  kind: z.enum(['review', 'review_comment']),
+  id: text,
+  author: sourceActorSchema.nullable(),
+  commit: gitObjectIdSchema.nullable(),
+  state: text.nullable(),
+  createdAt: z.iso.datetime({ offset: true }).nullable(),
+  url: z.url(),
+  body: z.string(),
+  submitKey: reviewKeySchema.optional(),
+});
+export const prReviewsSchema = z.object({ ref: prRefSchema, items: z.array(reviewItemSchema) });
+/** Every review thread on a pull request, read in full: a partial list could hide an open one. */
+export const prThreadsRequestSchema = requestBase.extend({
+  op: z.literal('pr.threads'),
+  ref: prRefSchema,
+});
+/**
+ * `commit` is the commit the comment was made on, null when the forge does not record one.
+ * `createdAt` and `commit` are absent when a plugin older than these fields answers, so a
+ * released plugin binary keeps working; a reader that needs them treats absence as unknown.
+ */
+export const reviewThreadCommentSchema = z.object({
+  id: text,
+  author: sourceActorSchema.nullable(),
+  createdAt: z.iso.datetime({ offset: true }).optional(),
+  commit: gitObjectIdSchema.nullable().optional(),
+  body: z.string(),
+  url: z.url(),
+});
+/** A thread's `createdAt` and `commit` are those of the comment that opened it. */
+export const reviewThreadSchema = z.object({
+  id: text,
+  createdAt: z.iso.datetime({ offset: true }).optional(),
+  commit: gitObjectIdSchema.nullable().optional(),
+  resolved: z.boolean(),
+  outdated: z.boolean(),
+  path: z.string().nullable(),
+  line: z.number().int().nullable(),
+  comments: z.array(reviewThreadCommentSchema),
+});
+export type ForgeReviewThread = z.infer<typeof reviewThreadSchema>;
+export const prThreadsSchema = z.object({ ref: prRefSchema, threads: z.array(reviewThreadSchema) });
+/** Every conversation comment on an issue or pull request, oldest first, read in full. */
+export const workItemCommentsRequestSchema = requestBase.extend({
+  op: z.literal('workitem.comments'),
+  subject: forgeSubjectRefSchema,
+});
+export const workItemCommentSchema = z.object({
+  id: text,
+  author: sourceActorSchema.nullable(),
+  url: z.url(),
+  body: z.string(),
+});
+/**
+ * How far a pull request's head is behind the pull request's own base branch, and whether it
+ * merges into it. A caller that needs the default branch reads it with `checks.commit` at
+ * `{kind:'default_branch'}`.
+ */
+export const prMergeStateRequestSchema = requestBase.extend({
+  op: z.literal('pr.merge-state'),
+  ref: prRefSchema,
+});
+export const prMergeStateSchema = z.object({
+  ref: prRefSchema,
+  head_revision: gitObjectIdSchema,
+  base_branch: text,
+  base_revision: gitObjectIdSchema,
+  /** Commits of `base_branch` at `base_revision` that the head at `head_revision` lacks. */
+  behind: z.number().int().nonnegative(),
+  mergeable: z.enum(['clean', 'conflict', 'unknown']),
+  /** The commit the pull request landed as; null until it is merged. */
+  merge_commit: gitObjectIdSchema.nullable(),
+});
+/** A reply on one review thread of the pull request `ref`. */
+export const prThreadReplyRequestSchema = requestBase.extend({
+  op: z.literal('pr.thread.reply'),
+  ref: prRefSchema,
+  thread: text,
+  body: text,
+});
+/** Resolve one review thread of the pull request `ref`. */
+export const prThreadResolveRequestSchema = requestBase.extend({
+  op: z.literal('pr.thread.resolve'),
+  ref: prRefSchema,
+  thread: text,
+});
+/** Every file a pull request changes, read in full: a partial list could hide a changed test. */
+export const prFilesRequestSchema = requestBase.extend({
+  op: z.literal('pr.files'),
+  ref: prRefSchema,
+});
+export const prFileSchema = z.object({
+  path: text,
+  /** The path before a rename or copy; null otherwise. */
+  previous_path: text.nullable(),
+  status: z.enum(['added', 'removed', 'modified', 'renamed', 'copied', 'changed', 'unchanged']),
+  /** The unified diff hunk; null when the forge has none, such as for a binary or very large file. */
+  patch: z.string().nullable(),
+});
+/**
+ * `head_revision` is the head the forge reported as the list was read, so a caller
+ * reads `repo.file` at the commit the patches belong to.
+ */
+export const prFilesSchema = z.object({
+  ref: prRefSchema,
+  head_revision: gitObjectIdSchema,
+  files: z.array(prFileSchema),
+});
+/**
+ * A repository-relative path. A `.` or `..` segment is refused rather than
+ * normalized: a forge URL built from it would resolve to another endpoint.
+ */
+const repoPathSchema = text.refine(
+  value => value.split('/').every(segment => segment !== '' && segment !== '.' && segment !== '..'),
+  'path must be repository-relative with no empty, . or .. segments'
+);
+/**
+ * A comment-kind review of the pull request at exactly `commit`, its head. It is
+ * presentation: nothing gates on it and no verdict is read back from it.
+ *
+ * Each comment's `line` is a line of `path` at `commit`. A comment whose line the
+ * diff does not show is written into the review's summary instead of inline. A
+ * review already posted with the same `key` at the same `commit` answers in place
+ * of a second one.
+ */
+export const prReviewSubmitRequestSchema = requestBase.extend({
+  op: z.literal('pr.review.submit'),
+  ref: prRefSchema,
+  commit: gitObjectIdSchema,
+  key: reviewKeySchema,
+  summary: text,
+  comments: z.array(
+    z.object({ path: repoPathSchema, line: z.number().int().positive(), body: text })
+  ),
+});
+/** One file's text at a commit. */
+export const repoFileRequestSchema = requestBase.extend({
+  op: z.literal('repo.file'),
+  repo: repoRefSchema,
+  path: repoPathSchema,
+  revision: gitObjectIdSchema,
+});
+export const repoFileSchema = z.object({
+  repo: repoRefSchema,
+  path: repoPathSchema,
+  revision: gitObjectIdSchema,
+  text: z.string(),
+});
+/** The image types `attachment.put` stores. SVG is left out: it can carry script. */
+export const attachmentContentTypeSchema = z.enum([
+  'image/png',
+  'image/jpeg',
+  'image/gif',
+  'image/webp',
+]);
+/** The most decoded bytes one `attachment.put` stores. */
+export const ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024;
+/**
+ * An image stored with the forge so a comment or review can embed it, such as a
+ * screenshot a stage took. It is presentation: anyone who can read `repo` can
+ * read the file, and nothing prunes it. The forge names the file by its content,
+ * so no caller-supplied name reaches it; what the bytes show is the caller's
+ * responsibility.
+ */
+export const attachmentPutRequestSchema = requestBase.extend({
+  op: z.literal('attachment.put'),
+  repo: repoRefSchema,
+  contentType: attachmentContentTypeSchema,
+  // A pattern rather than `z.base64()`: its JSON Schema `contentEncoding` keyword is
+  // one the script API type generator cannot state.
+  content: z
+    .string()
+    .regex(
+      /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/,
+      'content must be base64'
+    )
+    .refine(
+      value => {
+        const bytes = Buffer.byteLength(value, 'base64');
+        return bytes > 0 && bytes <= ATTACHMENT_MAX_BYTES;
+      },
+      `content must decode to between 1 byte and ${String(ATTACHMENT_MAX_BYTES)} bytes`
+    ),
+});
+/** Replace an issue's body. */
+export const workItemEditBodyRequestSchema = requestBase.extend({
+  op: z.literal('workitem.edit-body'),
+  ref: workItemRefSchema,
+  body: z.string(),
+});
+export const landedSchema = z.object({
+  commit: gitObjectIdSchema.nullable(),
+  tree: gitObjectIdSchema.nullable(),
+  parents: z.array(gitObjectIdSchema).nullable(),
+});
+export const rerunEvidenceSchema = z.object({
+  revision: gitObjectIdSchema,
+  requested: selectedChecksSchema,
+  observed: checkSelectionSchema,
+});
+export const mergeEvidenceSchema = z.object({
+  method: prMergeRequestSchema.shape.method,
+  conditions: mergeConditionsSchema,
+  landed: landedSchema.optional(),
+});
+
+export const lifecycleReadRequestSchemas = [
+  workItemViewRequestSchema,
+  prViewRequestSchema,
+  repoLabelsListRequestSchema,
+  prReviewsRequestSchema,
+  prThreadsRequestSchema,
+  workItemListRequestSchema,
+  workItemLabelAddedRequestSchema,
+  workItemSearchRequestSchema,
+  workItemCommentsRequestSchema,
+  prMergeStateRequestSchema,
+  prFilesRequestSchema,
+  repoFileRequestSchema,
+] as const;
+export const mutationRequestSchemas = [
+  prMergeRequestSchema,
+  checksRerunRequestSchema,
+  prCreateRequestSchema,
+  prEditBodyRequestSchema,
+  prReadyRequestSchema,
+  prDraftRequestSchema,
+  prCloseRequestSchema,
+  commentUpsertRequestSchema,
+  workItemCommentUpsertRequestSchema,
+  workItemCreateRequestSchema,
+  workItemCloseRequestSchema,
+  workItemLabelsSetRequestSchema,
+  workItemLabelAddRequestSchema,
+  workItemLabelRemoveRequestSchema,
+  repoLabelEnsureRequestSchema,
+  prThreadReplyRequestSchema,
+  prThreadResolveRequestSchema,
+  prReviewSubmitRequestSchema,
+  workItemEditBodyRequestSchema,
+  attachmentPutRequestSchema,
+] as const;
+export const mutationRequestSchema = z.discriminatedUnion('op', mutationRequestSchemas);
+export type ForgeMutationRequest = z.infer<typeof mutationRequestSchema>;
+export const mutationOperationSchema = z.enum(
+  mutationRequestSchemas.map(schema => schema.shape.op.value)
+);
+
+// Absent means the plugin does not report an author; null means the forge has none.
+const authorSchema = sourceActorSchema.nullable().optional();
+export const workItemViewSchema = subjectRecordSchema.extend({
+  title: z.string(),
+  body: z.string(),
+  labels: labelNamesSchema.optional(),
+  author: authorSchema,
+});
+const timestamp = z.iso.datetime({ offset: true });
+/**
+ * When a pull request was opened, merged and closed. A merged pull request's
+ * `closed_at` is whatever the forge reports: GitHub sets it, GitLab does not.
+ */
+export const prTimestampsSchema = z.object({
+  created_at: timestamp,
+  merged_at: timestamp.nullable(),
+  closed_at: timestamp.nullable(),
+});
+export const prViewSchema = z.object({
+  pr: forgePrRecordSchema,
+  title: z.string(),
+  body: z.string(),
+  author: authorSchema,
+  // Absent means the plugin does not report timestamps, as an older protocol-1 plugin does not.
+  timestamps: prTimestampsSchema.optional(),
+});
+/** Timestamps that contradict the pull request's state are a malformed answer, not a fact. */
+const prViewResultSchema = prViewSchema.superRefine(({ pr, timestamps }, ctx) => {
+  if (!timestamps) return;
+  const consistent =
+    pr.state === 'open'
+      ? timestamps.merged_at === null && timestamps.closed_at === null
+      : pr.state === 'merged'
+        ? timestamps.merged_at !== null
+        : timestamps.merged_at === null && timestamps.closed_at !== null;
+  if (!consistent)
+    ctx.addIssue({
+      code: 'custom',
+      message: `Timestamps must agree with a ${pr.state} pull request`,
+      path: ['timestamps'],
+    });
+});
+/**
+ * `updatedAt` is the forge's time of the item's last change. A label added later changes
+ * it, so an observer that sees it unchanged need not read the item's label events again;
+ * without it, the observer reads them on every pass. Optional, so a plugin released before
+ * it still answers.
+ */
+const workItemListItemSchema = subjectRecordSchema.extend({
+  updatedAt: z.iso.datetime({ offset: true }).optional(),
+});
+export const workItemListSchema = z.object({
+  repo: repoRefSchema,
+  label: text,
+  items: z.array(workItemListItemSchema),
+});
+/** `added` is null when the forge records no add of the label, such as one never added. */
+export const workItemLabelAddedSchema = z.object({
+  subject: forgeSubjectRefSchema,
+  name: text,
+  added: z
+    .object({ id: text, at: z.iso.datetime({ offset: true }), actor: sourceActorSchema.nullable() })
+    .nullable(),
+});
+export const workItemSearchItemSchema = subjectRecordSchema.extend({
+  title: z.string(),
+  updatedAt: z.iso.datetime({ offset: true }),
+});
+/** `truncated` says more items matched than `items` holds; a merged pull request is `closed`. */
+export const workItemSearchSchema = z.object({
+  repo: repoRefSchema,
+  text,
+  items: z.array(workItemSearchItemSchema),
+  truncated: z.boolean(),
+});
+export const workItemCommentsSchema = z.object({
+  workitem: subjectRecordSchema,
+  comments: z.array(workItemCommentSchema),
+});
+export const commentRecordSchema = z.object({
+  ref: prRefSchema,
+  id: text,
+  url: z.url(),
+  bodyDigest: text,
+});
+export type ForgeCommentRecord = z.infer<typeof commentRecordSchema>;
+
+/** The repository or item addressed by a mutation. */
+export const mutationTargetSchema = z.union([prRefSchema, repoRefSchema]);
+export type ForgeMutationTarget = z.infer<typeof mutationTargetSchema>;
+
+const failureBase = z.object({
+  op: mutationOperationSchema,
+  target: mutationTargetSchema,
+  merge: mergeEvidenceSchema.optional(),
+  rerun: rerunEvidenceSchema.optional(),
+});
+const failureObservations = {
+  observed: forgePrRecordSchema.optional(),
+  workitem: subjectRecordSchema.optional(),
+  label: labelRecordSchema.optional(),
+};
+export const mutationFailureSchema = z
+  .discriminatedUnion('outcome', [
+    failureBase.extend({ outcome: z.literal('refused'), ...failureObservations }),
+    failureBase.extend({
+      outcome: z.literal('verification_failed'),
+      ...failureObservations,
+      comment: commentRecordSchema.optional(),
+      // What may remain on the forge, in the operator's terms, so reconciliation
+      // starts from evidence rather than from a retry.
+      leaveBehind: text,
+    }),
+    // Nothing was read back, so an unknown outcome carries no observation.
+    failureBase.extend({ outcome: z.literal('outcome_unknown') }),
+  ])
+  .superRefine((value, ctx) => {
+    if (
+      (value.merge && value.op !== 'pr.merge') ||
+      (value.rerun && value.op !== 'checks.rerun') ||
+      (value.outcome === 'refused' && value.rerun && value.rerun.observed.length > 0)
+    )
+      ctx.addIssue({ code: 'custom', message: 'Mutation evidence belongs to its operation' });
+  });
+export type ForgeMutationFailure = z.infer<typeof mutationFailureSchema>;
+
+const appliedSchema = z.object({
+  target: mutationTargetSchema,
+  outcome: z.literal('applied'),
+  changed: z.boolean(),
+});
+const appliedPrSchema = appliedSchema.extend({ pr: forgePrRecordSchema });
+
+export const lifecycleReadResultSchemas = [
+  z.object({ op: prReviewsRequestSchema.shape.op, value: prReviewsSchema }),
+  z.object({ op: prThreadsRequestSchema.shape.op, value: prThreadsSchema }),
+  z.object({ op: workItemViewRequestSchema.shape.op, value: workItemViewSchema }),
+  z.object({ op: prViewRequestSchema.shape.op, value: prViewResultSchema.nullable() }),
+  z.object({ op: repoLabelsListRequestSchema.shape.op, value: repoLabelsListSchema }),
+  z.object({ op: workItemListRequestSchema.shape.op, value: workItemListSchema }),
+  z.object({ op: workItemLabelAddedRequestSchema.shape.op, value: workItemLabelAddedSchema }),
+  z.object({ op: workItemSearchRequestSchema.shape.op, value: workItemSearchSchema }),
+  z.object({ op: workItemCommentsRequestSchema.shape.op, value: workItemCommentsSchema }),
+  z.object({ op: prMergeStateRequestSchema.shape.op, value: prMergeStateSchema }),
+  z.object({ op: prFilesRequestSchema.shape.op, value: prFilesSchema }),
+  z.object({ op: repoFileRequestSchema.shape.op, value: repoFileSchema }),
+] as const;
+export const mutationResultSchemas = [
+  z.object({
+    op: workItemCreateRequestSchema.shape.op,
+    value: appliedSchema.extend({
+      workitem: workItemRecordSchema,
+      markerDigest: text,
+      titleDigest: text,
+      bodyDigest: text,
+    }),
+  }),
+  z.object({
+    op: workItemLabelsSetRequestSchema.shape.op,
+    value: appliedSchema.extend({ workitem: workItemRecordSchema, labels: labelNamesSchema }),
+  }),
+  // `labels` is the item's complete label set as read back after the write.
+  z.object({
+    op: workItemLabelAddRequestSchema.shape.op,
+    value: appliedSchema.extend({ workitem: subjectRecordSchema, labels: labelNamesSchema }),
+  }),
+  z.object({
+    op: workItemLabelRemoveRequestSchema.shape.op,
+    value: appliedSchema.extend({ workitem: subjectRecordSchema, labels: labelNamesSchema }),
+  }),
+  z.object({
+    op: repoLabelEnsureRequestSchema.shape.op,
+    value: appliedSchema.extend({ label: labelRecordSchema }),
+  }),
+  z.object({
+    op: prMergeRequestSchema.shape.op,
+    value: appliedSchema.extend({
+      target: prRefSchema,
+      changed: z.literal(true),
+      pr: forgePrRecordSchema,
+      method: prMergeRequestSchema.shape.method,
+      conditions: mergeConditionsSchema,
+      enforcedConditions: z.array(mergeConditionSchema),
+      landed: landedSchema,
+    }),
+  }),
+  z.object({
+    op: checksRerunRequestSchema.shape.op,
+    value: appliedSchema.extend({
+      target: prRefSchema,
+      changed: z.literal(true),
+      ref: prRefSchema,
+      revision: gitObjectIdSchema,
+      units: selectedChecksSchema,
+    }),
+  }),
+  z.object({ op: prCreateRequestSchema.shape.op, value: appliedPrSchema }),
+  z.object({
+    op: prEditBodyRequestSchema.shape.op,
+    value: appliedSchema.extend({ pr: forgePrRecordSchema, bodyDigest: text }),
+  }),
+  z.object({ op: prReadyRequestSchema.shape.op, value: appliedPrSchema }),
+  z.object({ op: prDraftRequestSchema.shape.op, value: appliedPrSchema }),
+  z.object({ op: prCloseRequestSchema.shape.op, value: appliedPrSchema }),
+  z.object({
+    op: commentUpsertRequestSchema.shape.op,
+    value: appliedSchema.extend({ comment: commentRecordSchema }),
+  }),
+  z.object({
+    op: workItemCommentUpsertRequestSchema.shape.op,
+    value: appliedSchema.extend({ workitem: subjectRecordSchema, comment: commentRecordSchema }),
+  }),
+  // `reason` is the close reason as read back after the write.
+  z.object({
+    op: workItemCloseRequestSchema.shape.op,
+    value: appliedSchema.extend({ workitem: workItemRecordSchema, reason: closeReasonSchema }),
+  }),
+  z.object({
+    op: prThreadReplyRequestSchema.shape.op,
+    value: appliedSchema.extend({ thread: text, comment: commentRecordSchema }),
+  }),
+  z.object({
+    op: prThreadResolveRequestSchema.shape.op,
+    value: appliedSchema.extend({ thread: text, resolved: z.literal(true) }),
+  }),
+  // `comments` has one entry per request comment, in request order: `inline` on its
+  // line, or `summary` when its line is outside the diff and it went into the body.
+  z.object({
+    op: prReviewSubmitRequestSchema.shape.op,
+    value: appliedSchema.extend({
+      target: prRefSchema,
+      review: z.object({
+        ref: prRefSchema,
+        id: text,
+        url: z.url(),
+        commit: gitObjectIdSchema,
+        key: reviewKeySchema,
+        bodyDigest: text,
+      }),
+      comments: z.array(
+        z.object({
+          path: text,
+          line: z.number().int().positive(),
+          placed: z.enum(['inline', 'summary']),
+        })
+      ),
+    }),
+  }),
+  z.object({
+    op: workItemEditBodyRequestSchema.shape.op,
+    value: appliedSchema.extend({ workitem: workItemRecordSchema, bodyDigest: text }),
+  }),
+  // `digest` is the sha256 hex of the stored bytes; `changed: false` means the forge
+  // already held them. `url` renders as the image in a comment on `target`.
+  z.object({
+    op: attachmentPutRequestSchema.shape.op,
+    value: appliedSchema.extend({
+      target: repoRefSchema,
+      attachment: z.object({
+        url: z.url(),
+        digest: text,
+        bytes: z.number().int().positive(),
+        contentType: attachmentContentTypeSchema,
+      }),
+    }),
+  }),
+] as const;
+
+export function mutationTarget(request: ForgeMutationRequest): ForgeMutationTarget {
+  if ('repo' in request) return request.repo;
+  return 'subject' in request ? request.subject.ref : request.ref;
+}
+
+export function mutationAttempt(
+  request: ForgeMutationRequest
+): Pick<ForgeMutationFailure, 'merge' | 'rerun'> {
+  if (request.op === 'pr.merge')
+    return { merge: { method: request.method, conditions: request.conditions } };
+  if (request.op === 'checks.rerun')
+    return { rerun: { revision: request.revision, requested: request.units, observed: [] } };
+  return {};
+}

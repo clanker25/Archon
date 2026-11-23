@@ -1,0 +1,417 @@
+import { lstat, readFile, readdir, stat } from 'node:fs/promises';
+import type { Dirent } from 'node:fs';
+import { basename, extname, join, relative } from 'node:path';
+import { z } from 'zod';
+import {
+  formatPackagedResourceReference,
+  isValidWorkflowFolderSegment,
+  PACK_DECLARATION_PATH,
+  PACK_SHARED_DIRECTORY,
+  PACK_SHARED_SCRIPTS_PATH,
+  type WorkflowResourceOwner,
+} from '../packaged-workflow';
+import {
+  loadErrorToError,
+  readPackWorkflowFolders,
+  type PackWorkflowLocation,
+  yamlCountError,
+} from '../workflow-discovery/pack-layout';
+import { getRuntimeForExtension } from '../script-runtime';
+import { ITEM_METRICS_FILE } from '../schemas/item-metric';
+import { METRIC_VIEWS_FILE } from '../schemas/metric-view';
+import type { BundledScriptPack } from './bundled-script-pack';
+
+const indexSchema = z
+  .object({
+    $comment: z.string().optional(),
+    packs: z
+      .array(z.string().refine(isValidWorkflowFolderSegment, 'Invalid bundle pack name'))
+      .refine(packs => new Set(packs).size === packs.length, 'Duplicate bundle pack'),
+  })
+  .strict();
+
+/** The generator's fixture repos provide their own index; production uses this module's. */
+export async function readBundleIndex(
+  path = join(import.meta.dir, 'bundle-index.json')
+): Promise<string[]> {
+  return indexSchema.parse(JSON.parse(await readFile(path, 'utf8'))).packs;
+}
+
+/** Whether a bundled `pack/workflow` reference can resolve from live source. A pack the
+ * index no longer names has stopped shipping. */
+export async function bundlesPackagedResources(pack: string): Promise<boolean> {
+  return (await readBundleIndex()).includes(pack);
+}
+
+export type BundledWorkflowOwner = Pick<WorkflowResourceOwner, 'pack' | 'workflow'>;
+type Script = BundledScriptPack['scripts'][string];
+
+/** Selection is shared by generation and live capture. Reading bytes is a separate step so
+ * a warm capture can revalidate the selected files without reading them all again. */
+export type BundleSourceFile = {
+  readonly sourcePath: string;
+  /** Path beneath the capture's bundled scope, always using forward slashes. */
+  readonly relativePath: string;
+} & (
+  | { readonly kind: 'workflow'; readonly name: string; readonly owner: BundledWorkflowOwner }
+  | { readonly kind: 'command'; readonly name: string }
+  | {
+      readonly kind: 'pack-file';
+      readonly pack: string;
+      readonly packPath: string;
+      /**
+       * The script-node names this file answers to. A workflow's own script has one; a
+       * pack's shared script has one for each workflow of the pack without a script of
+       * that name. A file that is no entry point has none.
+       */
+      readonly entries?: readonly { readonly name: string; readonly runtime: Script['runtime'] }[];
+    }
+);
+
+async function isDirectory(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+/** SDK consumers may have no installed source tree. Once the root exists, the complete
+ * indexed selection must be valid; a partial installation is an error. */
+export async function collectInstalledBundleSources(
+  workflowsRoot: string
+): Promise<BundleSourceFile[] | undefined> {
+  if (!(await installedRootExists(workflowsRoot))) return undefined;
+  return collectBundleSources(workflowsRoot, await readBundleIndex());
+}
+
+async function installedRootExists(path: string): Promise<boolean> {
+  try {
+    if (!(await stat(path)).isDirectory()) {
+      throw new Error(`Bundled source root is not a directory: ${path}`);
+    }
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
+function validateName(name: string, path: string): void {
+  if (!isValidWorkflowFolderSegment(name))
+    throw new Error(`Invalid bundled filename or directory "${path}".`);
+}
+
+// Non-shared bundled sources have always dereferenced authored links. Dirent alone
+// describes the link, so using its isFile/isDirectory would silently omit those files.
+async function entryType(
+  directory: string,
+  entry: Dirent
+): Promise<Pick<Dirent, 'isFile' | 'isDirectory'>> {
+  return entry.isSymbolicLink() ? await stat(join(directory, entry.name)) : entry;
+}
+
+// `.shared/` holds a pack's runtime modules, its markdown documents, its metric views and
+// its item metrics. Other files stay out: untracked strays such as `__pycache__/*.pyc` would
+// otherwise be selected and fail generation.
+function isSharedFile(name: string): boolean {
+  const extension = extname(name);
+  return (
+    getRuntimeForExtension(extension) !== undefined ||
+    extension === '.md' ||
+    name === METRIC_VIEWS_FILE ||
+    name === ITEM_METRICS_FILE
+  );
+}
+
+async function sharedFiles(directory: string): Promise<string[]> {
+  if ((await lstat(directory)).isSymbolicLink()) {
+    throw new Error(`Shared file symlinks are not supported: ${directory}`);
+  }
+  const files: string[] = [];
+  for (const entry of await readdir(directory, { withFileTypes: true })) {
+    const path = join(directory, entry.name);
+    if (entry.isSymbolicLink()) throw new Error(`Shared file symlinks are not supported: ${path}`);
+    if (entry.isDirectory()) files.push(...(await sharedFiles(path)));
+    else if (entry.isFile() && isSharedFile(entry.name)) files.push(path);
+  }
+  return files;
+}
+
+/** Only the indexed packs are inspected. Fixtures, prose and unrelated directories never
+ * enter the bundle merely because they live beside a workflow; prose enters only as a
+ * command or a `.shared/` document. A named missing pack fails. */
+export async function collectBundleSources(
+  workflowsRoot: string,
+  packs: readonly string[]
+): Promise<BundleSourceFile[]> {
+  const files: BundleSourceFile[] = [];
+  const add = uniqueNameAdder(files);
+  for (const pack of [...packs].sort()) await collectPack(workflowsRoot, pack, add);
+  return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+}
+
+type AddSource = (file: BundleSourceFile) => void;
+
+interface PackScope {
+  readonly workflowsRoot: string;
+  readonly pack: string;
+  readonly packRoot: string;
+  readonly add: AddSource;
+}
+
+/** Workflow and command names share one namespace each across every pack. */
+function uniqueNameAdder(files: BundleSourceFile[]): AddSource {
+  const names = { workflow: new Set<string>(), command: new Set<string>() };
+  return file => {
+    if (file.kind !== 'pack-file') {
+      const seen = names[file.kind];
+      if (seen.has(file.name))
+        throw new Error(`Bundled ${file.kind} filename collision: "${file.name}".`);
+      seen.add(file.name);
+    }
+    files.push(file);
+  };
+}
+
+async function collectPack(workflowsRoot: string, pack: string, add: AddSource): Promise<void> {
+  validateName(pack, pack);
+  const packRoot = join(workflowsRoot, pack);
+  if (!(await isDirectory(packRoot)))
+    throw new Error(`Indexed bundle pack "${pack}" directory not found: ${packRoot}`);
+  const scope: PackScope = { workflowsRoot, pack, packRoot, add };
+  await collectDeclaration(scope);
+  const listing = await readPackWorkflowFolders(packRoot, pack);
+  if ('error' in listing) throw loadErrorToError(listing.error);
+  const ownScripts = new Map<string, ReadonlySet<string>>();
+  for (const entry of listing.folders) {
+    if (entry.kind === 'error') throw loadErrorToError(entry.error);
+    // Discovery skips a folder with no YAML; a selected bundled pack must not, or a
+    // renamed or deleted YAML would ship a binary silently missing that workflow.
+    if (entry.kind === 'empty')
+      throw loadErrorToError(yamlCountError(`${pack}/${entry.folder}`, 0));
+    ownScripts.set(entry.folder, await collectWorkflow(scope, entry));
+  }
+  await collectSharedFiles(scope, ownScripts);
+}
+
+/**
+ * A `.shared/` file that is one of the pack's shared scripts: a runtime file directly in
+ * `.shared/scripts/` or one directory below it, as in a workflow's own `scripts/`.
+ */
+function sharedScript(packPath: string): { name: string; runtime: Script['runtime'] } | undefined {
+  const prefix = `${PACK_SHARED_SCRIPTS_PATH}/`;
+  const extension = extname(packPath);
+  const scriptRuntime = getRuntimeForExtension(extension);
+  if (!packPath.startsWith(prefix) || scriptRuntime === undefined) return undefined;
+  if (packPath.slice(prefix.length).split('/').length > 2) return undefined;
+  return { name: basename(packPath, extension), runtime: scriptRuntime };
+}
+
+/** @param ownScripts each workflow folder's own script names, which win over shared ones. */
+async function collectSharedFiles(
+  { pack, packRoot, add }: PackScope,
+  ownScripts: ReadonlyMap<string, ReadonlySet<string>>
+): Promise<void> {
+  const shared = join(packRoot, PACK_SHARED_DIRECTORY);
+  if (!(await isDirectory(shared))) return;
+  const seen = new Set<string>();
+  for (const path of await sharedFiles(shared)) {
+    const packPath = relative(packRoot, path).replaceAll('\\', '/');
+    const script = sharedScript(packPath);
+    if (script !== undefined) {
+      validateName(script.name, packPath);
+      if (seen.has(script.name))
+        throw new Error(`Duplicate shared script "${script.name}" in ${pack}.`);
+      seen.add(script.name);
+    }
+    add({
+      kind: 'pack-file',
+      pack,
+      packPath,
+      sourcePath: path,
+      relativePath: `workflows/${pack}/${packPath}`,
+      ...(script !== undefined
+        ? {
+            entries: [...ownScripts]
+              .filter(([, own]) => !own.has(script.name))
+              .map(([workflow]) => ({
+                name: formatPackagedResourceReference(bundledOwner(pack, workflow), script.name),
+                runtime: script.runtime,
+              })),
+          }
+        : {}),
+    });
+  }
+}
+
+/** The pack's settings declaration ships beside its workflows, so a bundled pack has
+ * the same settings as the pack folder it was built from. */
+async function collectDeclaration({ pack, packRoot, add }: PackScope): Promise<void> {
+  const path = join(packRoot, PACK_DECLARATION_PATH);
+  try {
+    await stat(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return;
+    throw error;
+  }
+  add({
+    kind: 'pack-file',
+    pack,
+    packPath: PACK_DECLARATION_PATH,
+    sourcePath: path,
+    relativePath: `workflows/${pack}/${PACK_DECLARATION_PATH}`,
+  });
+}
+
+async function collectWorkflow(
+  scope: PackScope,
+  { folder: workflow, path: directory, filename }: PackWorkflowLocation
+): Promise<ReadonlySet<string>> {
+  const { workflowsRoot, pack, add } = scope;
+  const path = join(directory, filename);
+  const name = basename(path, extname(path));
+  validateName(name, path);
+  add({
+    kind: 'workflow',
+    name,
+    owner: { pack, workflow },
+    sourcePath: path,
+    relativePath: `workflows/${relative(workflowsRoot, path).replaceAll('\\', '/')}`,
+  });
+  await collectCommands(scope, workflow);
+  return collectScripts(scope, workflow);
+}
+
+function bundledOwner(pack: string, workflow: string): WorkflowResourceOwner {
+  return { source: 'bundled', pack, workflow };
+}
+
+async function collectCommands(
+  { pack, packRoot, add }: PackScope,
+  workflow: string
+): Promise<void> {
+  const commands = join(packRoot, workflow, 'commands');
+  if (!(await isDirectory(commands))) return;
+  for (const entry of await readdir(commands, { withFileTypes: true })) {
+    if (!(await entryType(commands, entry)).isFile() || !entry.name.endsWith('.md')) continue;
+    const name = basename(entry.name, '.md');
+    validateName(name, entry.name);
+    add({
+      kind: 'command',
+      name: formatPackagedResourceReference(bundledOwner(pack, workflow), name),
+      sourcePath: join(commands, entry.name),
+      relativePath: `workflows/${pack}/${workflow}/commands/${entry.name}`,
+    });
+  }
+}
+
+/**
+ * Script entries are the runtime files directly in `scripts/` or one directory below it.
+ * Returns their names.
+ */
+async function collectScripts(
+  { pack, packRoot, add }: PackScope,
+  workflow: string
+): Promise<ReadonlySet<string>> {
+  const scripts = join(packRoot, workflow, 'scripts');
+  const seen = new Set<string>();
+  if (!(await isDirectory(scripts))) return seen;
+  for (const entry of await readdir(scripts, { withFileTypes: true })) {
+    for (const candidate of await scriptCandidates(scripts, entry)) {
+      const extension = extname(candidate);
+      const scriptRuntime = getRuntimeForExtension(extension);
+      if (scriptRuntime === undefined) continue;
+      const name = basename(candidate, extension);
+      validateName(name, candidate);
+      if (seen.has(name))
+        throw new Error(`Duplicate packaged script "${name}" in ${pack}/${workflow}.`);
+      seen.add(name);
+      const packPath = `${workflow}/scripts/${candidate}`;
+      add({
+        kind: 'pack-file',
+        pack,
+        packPath,
+        sourcePath: join(packRoot, packPath),
+        relativePath: `workflows/${pack}/${packPath}`,
+        entries: [
+          {
+            name: formatPackagedResourceReference(bundledOwner(pack, workflow), name),
+            runtime: scriptRuntime,
+          },
+        ],
+      });
+    }
+  }
+  return seen;
+}
+
+async function scriptCandidates(scripts: string, entry: Dirent): Promise<string[]> {
+  const kind = await entryType(scripts, entry);
+  if (kind.isFile()) return [entry.name];
+  if (!kind.isDirectory()) return [];
+  const directory = join(scripts, entry.name);
+  const candidates: string[] = [];
+  for (const child of await readdir(directory, { withFileTypes: true })) {
+    if ((await entryType(directory, child)).isFile())
+      candidates.push(`${entry.name}/${child.name}`);
+  }
+  return candidates;
+}
+
+export async function readBundleContent(file: BundleSourceFile): Promise<string> {
+  const content = (await readFile(file.sourcePath, 'utf8')).replace(/\r\n/g, '\n');
+  // Empty shared modules (e.g. Python __init__.py) are meaningful, unlike entry points.
+  if (!content.trim() && !(file.kind === 'pack-file' && file.entries === undefined)) {
+    throw new Error(`Bundled default "${file.sourcePath}" is empty.`);
+  }
+  return content;
+}
+
+export interface BundleRecords {
+  commands: Record<string, string>;
+  workflows: Record<string, string>;
+  workflowPaths: Record<string, string>;
+  workflowOwners: Readonly<Partial<Record<string, BundledWorkflowOwner>>>;
+  scriptPacks: Record<string, BundledScriptPack>;
+}
+
+/** The records source builds read and the binary embeds. Key order is part of the
+ * contract: name resolution and telemetry signature matching iterate these records. */
+export async function readBundleRecords(
+  files: readonly BundleSourceFile[]
+): Promise<BundleRecords> {
+  const commands = new Map<string, string>();
+  const workflows = new Map<string, string>();
+  const workflowPaths = new Map<string, string>();
+  const workflowOwners = new Map<string, BundledWorkflowOwner>();
+  const scriptPacks = new Map<
+    string,
+    { files: Record<string, string>; scripts: Record<string, Script> }
+  >();
+  for (const file of files) {
+    const content = await readBundleContent(file);
+    if (file.kind === 'command') commands.set(file.name, content);
+    else if (file.kind === 'workflow') {
+      workflows.set(file.name, content);
+      workflowPaths.set(file.name, file.relativePath);
+      workflowOwners.set(file.name, file.owner);
+    } else {
+      let pack = scriptPacks.get(file.pack);
+      if (pack === undefined) scriptPacks.set(file.pack, (pack = { files: {}, scripts: {} }));
+      pack.files[file.packPath] = content;
+      for (const entry of file.entries ?? [])
+        pack.scripts[entry.name] = { path: file.packPath, runtime: entry.runtime };
+    }
+  }
+  const sorted = <T>(entries: ReadonlyMap<string, T>): Record<string, T> =>
+    Object.fromEntries([...entries].sort(([a], [b]) => a.localeCompare(b)));
+  return {
+    commands: sorted(commands),
+    workflows: sorted(workflows),
+    workflowPaths: sorted(workflowPaths),
+    workflowOwners: sorted(workflowOwners),
+    scriptPacks: sorted(scriptPacks),
+  };
+}

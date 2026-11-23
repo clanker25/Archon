@@ -1,0 +1,12 @@
+{
+  "claude": {
+    "small": { "model": "haiku" },
+    "medium": { "model": "sonnet" },
+    "large": { "model": "opus" }
+  },
+  "codex": {
+    "small": { "model": "gpt-6-luna" },
+    "medium": { "model": "gpt-6.1-terra" },
+    "large": { "model": "gpt-6.1-sol" }
+  }
+}

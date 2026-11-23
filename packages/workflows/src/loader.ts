@@ -1,0 +1,476 @@
+/**
+ * Workflow loader - parses and validates a workflow YAML file
+ */
+import { LineCounter, parseDocument } from 'yaml';
+import type { ProviderRegistry } from '@archon/provider-contract';
+import type { WorkflowDefinition, WorkflowLoadError, DagNode, IncludeDirective } from './schemas';
+import type { WorkflowPack } from './schemas/pack-settings';
+import { sandboxSettingsSchema } from './schemas/dag-node';
+import { modelReasoningEffortSchema, webSearchModeSchema } from './schemas/workflow';
+import { validateInlineExecInputs } from './exec-input-validation';
+import { isIncludeDirective, isLoopGroupNode } from './schemas';
+import { PACK_DIR_REFERENCE } from './workflow-variables';
+import { getLog } from './loader/log';
+import {
+  validateLoopGroupProseCompletion,
+  validateNodeOutputFormats,
+  validateRunBudgetShape,
+  validateWorkflowResultContract,
+} from './loader/contracts';
+import {
+  collectConditionalJoinWarnings,
+  collectLegacyPauseWarnings,
+  collectUnknownWorkflowKeys,
+} from './loader/parse-warnings';
+import {
+  parseBetas,
+  parseContainerPolicy,
+  parseDeprecation,
+  parseFallbackModel,
+  parseWorkflowModel,
+  inputEnvKeyCollision,
+  parseInputs,
+  parseMutatesCheckout,
+  parseOptionalField,
+  parseWorkflowResource,
+  parseRequires,
+  parseReturns,
+  parseRunBudget,
+  parseTags,
+  parseWorktreePolicy,
+  resolveEffort,
+} from './loader/workflow-fields';
+import { parseDagNodes } from './loader/node-parse';
+import {
+  persistSessionError,
+  sameContextProviderError,
+  sessionResumeProviderError,
+  unknownProviderError,
+} from './loader/provider-checks';
+import { validateDagStructure } from './loader/dag-structure';
+
+/**
+ * Parse workflow YAML with Bun's parser. Every reader of a workflow file goes through here.
+ * CRLF is normalized first: Bun keeps the line break of a multi-line quoted scalar in a CRLF
+ * file where the YAML spec (and LF input) folds it to a space.
+ */
+export function parseYaml(content: string): unknown {
+  return Bun.YAML.parse(content.replaceAll('\r\n', '\n'));
+}
+
+export type ParseResult =
+  | { workflow: WorkflowDefinition; error: null; warnings: string[] }
+  | { workflow: null; error: WorkflowLoadError; warnings?: never };
+
+interface WorkflowHeader {
+  readonly name: string;
+  readonly description: string;
+  readonly nodes: readonly unknown[];
+}
+
+/**
+ * The fields every workflow must have, or the error for a document that is not a workflow:
+ * not an object, a removed field, a missing name or description, legacy `steps:` or no `nodes:`.
+ */
+function parseWorkflowHeader(
+  raw: Record<string, unknown>,
+  filename: string
+): WorkflowHeader | string {
+  if (!raw || typeof raw !== 'object') {
+    return 'YAML file is empty or does not contain an object';
+  }
+
+  if (Object.hasOwn(raw, 'thinking')) {
+    return "'thinking:' has been removed; use 'effort:' instead";
+  }
+  if (Object.hasOwn(raw, 'outcome_field')) {
+    return "'outcome_field:' has been removed; declare 'returns: { node: <id>, outcome: <field> }' instead";
+  }
+  if (Object.hasOwn(raw, 'evidence_policy')) {
+    return "'evidence_policy:' has been removed; use a 'bash:' or 'script:' node that exits non-zero to fail the run instead";
+  }
+
+  // A load failure reaches the author through the returned `error`, which discovery
+  // collects for `workflow list`, `validate workflows`, `workflow run`, and the API.
+  // Like parse warnings, the log line is debug so a broken file is not repeated on
+  // every discovery (#3444).
+  if (!raw.name || typeof raw.name !== 'string') {
+    getLog().debug({ filename }, 'workflow_missing_name');
+    return "Missing required field 'name'";
+  }
+  if (!raw.description || typeof raw.description !== 'string') {
+    getLog().debug({ filename }, 'workflow_missing_description');
+    return "Missing required field 'description'";
+  }
+
+  if (Object.hasOwn(raw, 'steps')) {
+    return '`steps:` format has been removed. Workflows must use `nodes:` (DAG) format. See https://archon.diy/reference/workflow-language/ for the workflow language reference.';
+  }
+
+  if (!Array.isArray(raw.nodes) || raw.nodes.length === 0) {
+    getLog().debug({ filename }, 'workflow_missing_nodes');
+    return "Workflow must have 'nodes:' configuration";
+  }
+  return { name: raw.name, description: raw.description, nodes: raw.nodes };
+}
+
+/** The first graph-level error in the parsed nodes: structure, output formats, prose completion. */
+function nodeGraphError(
+  dagNodes: readonly (DagNode | IncludeDirective)[],
+  filename: string
+): string | null {
+  const structureError = validateDagStructure(dagNodes);
+  if (structureError) {
+    getLog().debug({ filename, structureError }, 'dag_structure_invalid');
+    return structureError;
+  }
+
+  const outputFormatError = validateNodeOutputFormats(dagNodes);
+  if (outputFormatError) {
+    getLog().debug({ filename, outputFormatError }, 'output_format_rejected');
+    return outputFormatError;
+  }
+
+  const proseCompletionError = validateLoopGroupProseCompletion(dagNodes);
+  if (proseCompletionError) {
+    getLog().debug({ filename, proseCompletionError }, 'loop_group_prose_completion_rejected');
+    return proseCompletionError;
+  }
+  return null;
+}
+
+/**
+ * Parse and validate a workflow YAML file.
+ *
+ * @param pack the pack the file was loaded from, set by discovery for a packaged workflow.
+ *   Its settings count as declared inputs for the checks that need every input name.
+ */
+export function parseWorkflow(
+  content: string,
+  filename: string,
+  providers: ProviderRegistry,
+  configuredEnvNames?: ReadonlySet<string>,
+  pack?: WorkflowPack
+): ParseResult {
+  try {
+    const raw = parseYaml(content) as Record<string, unknown>;
+    return parseWorkflowDocument(raw, filename, providers, configuredEnvNames, pack);
+  } catch (error) {
+    return yamlParseFailure(filename, content, error as Error);
+  }
+}
+
+/** Header, nodes and graph first, then the workflow-level fields, then whole-workflow contracts. */
+function parseWorkflowDocument(
+  raw: Record<string, unknown>,
+  filename: string,
+  providers: ProviderRegistry,
+  configuredEnvNames: ReadonlySet<string> | undefined,
+  pack: WorkflowPack | undefined
+): ParseResult {
+  const reject = (error: string): ParseResult => ({
+    workflow: null,
+    error: { filename, error, errorType: 'validation_error' },
+  });
+
+  const header = parseWorkflowHeader(raw, filename);
+  if (typeof header === 'string') return reject(header);
+
+  const parsedNodes = parseDagNodes(header.nodes, filename);
+  if (typeof parsedNodes === 'string') return reject(parsedNodes);
+  const { nodes: dagNodes, warnings: parseWarnings } = parsedNodes;
+
+  const graphError = nodeGraphError(dagNodes, filename);
+  if (graphError !== null) return reject(graphError);
+
+  collectConditionalJoinWarnings(dagNodes, parseWarnings);
+  collectLegacyPauseWarnings(dagNodes, header.nodes, parseWarnings);
+  warnInteractiveDeprecated(raw, header.name, filename, parseWarnings);
+
+  const fields = parseWorkflowFields(
+    raw,
+    header.name,
+    dagNodes,
+    filename,
+    providers,
+    parseWarnings
+  );
+  if (typeof fields === 'string') return reject(fields);
+
+  collectUnknownWorkflowKeys(raw, header.name, parseWarnings);
+
+  const workflow = buildWorkflowDefinition(header, dagNodes, fields, pack);
+  const contractError = workflowContractError(workflow, configuredEnvNames, parseWarnings);
+  if (contractError !== null) return reject(contractError);
+
+  return {
+    workflow,
+    error: null,
+    warnings: parseWarnings,
+  };
+}
+
+function warnInteractiveDeprecated(
+  raw: Record<string, unknown>,
+  workflowName: string,
+  filename: string,
+  parseWarnings: string[]
+): void {
+  if (raw.interactive === undefined) return;
+  const message =
+    `Workflow '${workflowName}': workflow-level 'interactive:' is deprecated and has no effect. ` +
+    'Any workflow can start in the foreground, in the background or from a trigger; a ' +
+    'pause waits in the attention queue until it is answered. Remove the line.';
+  parseWarnings.push(message);
+  getLog().debug({ filename, warning: message }, 'workflow_interactive_deprecated');
+}
+
+/** The workflow-level fields, each already validated, before they are assembled. */
+interface WorkflowFields {
+  readonly provider: string | undefined;
+  readonly model: WorkflowDefinition['model'];
+  readonly webSearchMode: WorkflowDefinition['webSearchMode'];
+  readonly persistSessions: boolean;
+  readonly mutatesCheckout: ReturnType<typeof parseMutatesCheckout>;
+  readonly resource: WorkflowDefinition['resource'];
+  readonly effort: ReturnType<typeof resolveEffort>;
+  readonly fallbackModel: ReturnType<typeof parseFallbackModel>;
+  readonly betas: ReturnType<typeof parseBetas>;
+  readonly sandbox: WorkflowDefinition['sandbox'];
+  readonly worktree: ReturnType<typeof parseWorktreePolicy>;
+  readonly container: ReturnType<typeof parseContainerPolicy>;
+  readonly budget: WorkflowDefinition['budget'];
+  readonly tags: ReturnType<typeof parseTags>;
+  readonly requires: ReturnType<typeof parseRequires>;
+  readonly inputs: WorkflowDefinition['inputs'];
+  readonly returns: WorkflowDefinition['returns'];
+  readonly result: WorkflowDefinition['result'];
+  readonly deprecated: WorkflowDefinition['deprecated'];
+}
+
+/**
+ * Every workflow-level field, or the first error. Fields that are invalid but harmless
+ * (`modelReasoningEffort`, `webSearchMode`, `sandbox` and the warn-only parsers) are
+ * logged and ignored rather than rejected, as they always were.
+ */
+function parseWorkflowFields(
+  raw: Record<string, unknown>,
+  workflowName: string,
+  dagNodes: readonly (DagNode | IncludeDirective)[],
+  filename: string,
+  providers: ProviderRegistry,
+  parseWarnings: string[]
+): WorkflowFields | string {
+  const provider =
+    typeof raw.provider === 'string' && raw.provider.length > 0 ? raw.provider : undefined;
+  const model = parseWorkflowModel(raw.model);
+  if ('error' in model) return model.error;
+
+  const persistSessions = raw.persist_sessions === true;
+  const providerError =
+    unknownProviderError(provider, dagNodes, providers) ??
+    sessionResumeProviderError(dagNodes, provider, providers) ??
+    persistSessionError(dagNodes, persistSessions, provider, providers, parseWarnings) ??
+    sameContextProviderError(dagNodes, provider, providers, parseWarnings);
+  if (providerError !== null) return providerError;
+
+  const modelReasoningEffort = parseOptionalField(
+    raw.modelReasoningEffort,
+    modelReasoningEffortSchema,
+    filename,
+    'invalid_model_reasoning_effort',
+    { valid: modelReasoningEffortSchema.options }
+  );
+  // Parsed here for validation only. The deprecation is RESOLVED below, in
+  // `resolveEffort`, because translating needs `effort` too:
+  // `modelReasoningEffort` becomes `effort` and is never carried forward.
+  const webSearchMode = parseOptionalField(
+    raw.webSearchMode,
+    webSearchModeSchema,
+    filename,
+    'invalid_web_search_mode',
+    { valid: webSearchModeSchema.options }
+  );
+
+  const worktree = parseWorktreePolicy(raw.worktree, filename);
+  const container = parseContainerPolicy(raw.container, filename);
+  const budget = parseRunBudget(raw.budget);
+  if ('error' in budget) return budget.error;
+  const deprecated = parseDeprecation(raw.deprecated);
+  if ('error' in deprecated) return deprecated.error;
+  const mutatesCheckout = parseMutatesCheckout(raw.mutates_checkout, filename);
+  const resource = parseWorkflowResource(raw.resource);
+  if ('error' in resource) return resource.error;
+  const tags = parseTags(raw.tags, filename);
+  const requires = parseRequires(raw.requires, filename);
+  const inputs = parseInputs(raw.inputs, filename);
+  if ('error' in inputs) return inputs.error;
+  const returns = parseReturns(raw.returns, dagNodes, filename);
+  if ('error' in returns) return returns.error;
+  const effort = resolveEffort(
+    raw.effort,
+    modelReasoningEffort,
+    workflowName,
+    filename,
+    parseWarnings
+  );
+  const sandbox = parseOptionalField(
+    raw.sandbox,
+    sandboxSettingsSchema,
+    filename,
+    'invalid_workflow_sandbox_value_ignored'
+  );
+
+  return {
+    provider,
+    model: model.value,
+    webSearchMode,
+    persistSessions,
+    mutatesCheckout,
+    resource: resource.value,
+    effort,
+    fallbackModel: parseFallbackModel(raw.fallbackModel, filename),
+    betas: parseBetas(raw.betas, filename),
+    sandbox,
+    worktree,
+    container,
+    budget: budget.value,
+    tags,
+    requires,
+    inputs: inputs.value,
+    returns: returns.value?.node,
+    result: returns.value?.result,
+    deprecated: deprecated.value,
+  };
+}
+
+/** Unset optional fields are left out of the definition, except `provider` and `webSearchMode`. */
+function buildWorkflowDefinition(
+  header: WorkflowHeader,
+  dagNodes: (DagNode | IncludeDirective)[],
+  fields: WorkflowFields,
+  pack: WorkflowPack | undefined
+): WorkflowDefinition {
+  return {
+    ...(pack !== undefined ? { pack: { ...pack, workflow: header.name } } : {}),
+    name: header.name,
+    description: header.description,
+    provider: fields.provider,
+    model: fields.model,
+    // `modelReasoningEffort` is deliberately absent — it was translated into
+    // `effort` by `resolveEffort`, so nothing downstream ever sees the deprecated field.
+    webSearchMode: fields.webSearchMode,
+    ...executionSettings(fields),
+    nodes: dagNodes,
+    ...runPolicies(fields),
+  };
+}
+
+function executionSettings(fields: WorkflowFields): Partial<WorkflowDefinition> {
+  return {
+    ...(fields.mutatesCheckout !== undefined ? { mutates_checkout: fields.mutatesCheckout } : {}),
+    ...(fields.resource !== undefined ? { resource: fields.resource } : {}),
+    ...(fields.effort !== undefined ? { effort: fields.effort } : {}),
+    ...(fields.fallbackModel !== undefined ? { fallbackModel: fields.fallbackModel } : {}),
+    ...(fields.betas !== undefined ? { betas: fields.betas } : {}),
+    ...(fields.sandbox !== undefined ? { sandbox: fields.sandbox } : {}),
+    ...(fields.persistSessions ? { persist_sessions: true } : {}),
+  };
+}
+
+function runPolicies(fields: WorkflowFields): Partial<WorkflowDefinition> {
+  return {
+    ...(fields.worktree ? { worktree: fields.worktree } : {}),
+    ...(fields.container ? { container: fields.container } : {}),
+    ...(fields.budget !== undefined ? { budget: fields.budget } : {}),
+    ...(fields.tags !== undefined ? { tags: fields.tags } : {}),
+    ...(fields.requires !== undefined ? { requires: fields.requires } : {}),
+    ...(fields.inputs !== undefined ? { inputs: fields.inputs } : {}),
+    ...(fields.returns !== undefined ? { returns: fields.returns } : {}),
+    ...(fields.result !== undefined ? { result: fields.result } : {}),
+    ...(fields.deprecated !== undefined ? { deprecated: fields.deprecated } : {}),
+  };
+}
+
+/** The first error in the contracts that span the whole workflow: exec inputs, outcome, budget. */
+function workflowContractError(
+  workflow: WorkflowDefinition,
+  configuredEnvNames: ReadonlySet<string> | undefined,
+  parseWarnings: string[]
+): string | null {
+  // A pack setting is delivered as an input, so it shares the inputs' env-key space. The
+  // same name in both is the workflow overriding the pack's value, not a collision.
+  if (workflow.pack?.settings !== undefined) {
+    const collision = inputEnvKeyCollision([
+      ...Object.keys(workflow.inputs ?? {}),
+      ...Object.keys(workflow.pack.settings),
+    ]);
+    if (collision !== null) return `${collision} (workflow inputs and pack settings)`;
+  }
+  const packDirInclude = includePassingPackDir(workflow.nodes);
+  if (packDirInclude !== undefined) {
+    return `Node '${packDirInclude}' passes $PACK_DIR through 'with:'. An included block resolves its text in its own pack, so the value would name the block's pack, not this file's. Reference $PACK_DIR inside the block instead.`;
+  }
+  const execInputValidation = validateInlineExecInputs(workflow, configuredEnvNames);
+  parseWarnings.push(...execInputValidation.warnings);
+  if (execInputValidation.errors.length > 0) return execInputValidation.errors.join(' ');
+  return validateWorkflowResultContract(workflow) ?? validateRunBudgetShape(workflow);
+}
+
+/**
+ * The author-facing error for a workflow Bun's YAML parser rejected. Bun's YAML errors carry no
+ * source position (their `line`/`column` are the JavaScript call site), so the `yaml` package
+ * re-parses the text on this failure path only, and its structured error offset gives the
+ * line and column.
+ */
+function yamlParseFailure(filename: string, content: string, err: Error): ParseResult {
+  const location = locateYamlError(content);
+  // Debug for the same reason as the validation failures above: the returned
+  // parse_error is what the author sees, and discovery re-parses on every command.
+  // The reason and source line stay out of the log: both can quote the file's text.
+  getLog().debug({ filename, line: location?.line, col: location?.col }, 'workflow_parse_failed');
+  // The two parsers can disagree. Bun decides whether a file loads, so when `yaml` accepts
+  // what Bun rejected, report Bun's error without inventing a position.
+  const error = location
+    ? `${filename}:${location.line}:${location.col}: YAML syntax error: ${location.reason}\n  ${location.sourceLine}\n  ${' '.repeat(location.col - 1)}^`
+    : `${filename}: YAML syntax error: ${err.message}`;
+  return { workflow: null, error: { filename, error, errorType: 'parse_error' } };
+}
+
+function locateYamlError(
+  content: string
+): { line: number; col: number; reason: string; sourceLine: string } | undefined {
+  // Normalized as parseYaml does, so positions match the text Bun saw.
+  const normalized = content.replaceAll('\r\n', '\n');
+  const lineCounter = new LineCounter();
+  const first = parseDocument(normalized, { prettyErrors: false, lineCounter }).errors[0];
+  if (first === undefined) return undefined;
+  const { line, col } = lineCounter.linePos(first.pos[0]);
+  return {
+    line,
+    col,
+    reason: first.message,
+    sourceLine: normalized.split('\n')[line - 1] ?? '',
+  };
+}
+
+/**
+ * The id of an `include:` node whose `with:` passes `$PACK_DIR`. The value is spliced into
+ * the block and resolved in the block's pack at run time, so it would silently name the
+ * wrong pack; refusing it keeps "text resolves in the pack of the file that wrote it".
+ */
+function includePassingPackDir(nodes: WorkflowDefinition['nodes']): string | undefined {
+  for (const node of nodes) {
+    if (isIncludeDirective(node)) {
+      // Stringified so a reference nested in an array or object value is caught too.
+      const passes = Object.values(node.with ?? {}).some(value =>
+        PACK_DIR_REFERENCE.test(JSON.stringify(value))
+      );
+      if (passes) return node.id;
+    } else if (isLoopGroupNode(node)) {
+      const nested = includePassingPackDir(node.loop_group.nodes);
+      if (nested !== undefined) return nested;
+    }
+  }
+  return undefined;
+}

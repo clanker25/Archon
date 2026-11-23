@@ -1,0 +1,24 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@archon/core": ["../core/src"],
+      "@archon/core/*": ["../core/src/*"],
+      "@archon/workflows": ["../workflows/src"],
+      "@archon/workflows/*": ["../workflows/src/*"],
+      "@archon/paths": ["../paths/src"],
+      "@archon/git": ["../git/src"]
+    }
+  },
+  "include": ["src/**/*", "../workflows/src/defaults/text-imports.d.ts"],
+  "exclude": ["node_modules", "dist"],
+  "references": [
+    { "path": "../core" },
+    { "path": "../forge" },
+    { "path": "../git" },
+    { "path": "../isolation" },
+    { "path": "../paths" },
+    { "path": "../providers" },
+    { "path": "../workflows" }
+  ]
+}

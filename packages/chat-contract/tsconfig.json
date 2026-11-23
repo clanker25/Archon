@@ -1,0 +1,6 @@
+{
+  "extends": "../../tsconfig.json",
+  "include": ["src/**/*", "src/**/*.json", "schema/*.json"],
+  "exclude": ["node_modules", "dist"],
+  "references": [{ "path": "../provider-contract" }]
+}
